@@ -20,7 +20,7 @@ import hashlib
 import logging
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.engine import get_database
@@ -50,43 +50,29 @@ async def select_cover_posters(library_id: int) -> list[Path]:
     """选出该库最近入库、有本地海报资产的至多 4 部作品的海报绝对路径。"""
     root = _assets_root()
     async with get_database().session() as session:
+        # 只需要海报路径与入库时间：整行读取会反序列化每部作品的简介、演员等
+        # 大字段；VidHub 的根级 Items 每次启动都会走这里，大库上代价不可接受。
         rows = (
             await session.execute(
                 select(
-                    LibraryFile.media_item_id,
-                    LibraryFile.created_at,
-                ).where(
-                    LibraryFile.library_id == library_id,
-                    LibraryFile.media_item_id.is_not(None),
-                    LibraryFile.missing_since.is_(None),
+                    MediaMetadata.poster_file,
+                    func.max(LibraryFile.created_at).label("latest_created_at"),
                 )
+                .join(
+                    LibraryFile,
+                    LibraryFile.media_item_id == MediaMetadata.media_item_id,
+                )
+                .where(
+                    LibraryFile.library_id == library_id,
+                    LibraryFile.missing_since.is_(None),
+                    MediaMetadata.poster_file.is_not(None),
+                )
+                .group_by(MediaMetadata.media_item_id, MediaMetadata.poster_file)
+                .order_by(func.max(LibraryFile.created_at).desc())
             )
         ).all()
-        if not rows:
-            return []
-        # 每个条目取最近一次入库时间，按新→旧排
-        latest: dict[int, object] = {}
-        for item_id, created_at in rows:
-            if item_id not in latest or created_at > latest[item_id]:
-                latest[item_id] = created_at
-        ordered_ids = [i for i, _ in sorted(latest.items(), key=lambda kv: kv[1], reverse=True)]
-
-        posters = {
-            m.media_item_id: m.poster_file
-            for m in (
-                await session.execute(
-                    select(MediaMetadata).where(
-                        MediaMetadata.media_item_id.in_(ordered_ids),
-                        MediaMetadata.poster_file.is_not(None),
-                    )
-                )
-            ).scalars()
-        }
     result: list[Path] = []
-    for item_id in ordered_ids:
-        rel = posters.get(item_id)
-        if not rel:
-            continue
+    for rel, _created_at in rows:
         path = root / rel
         if path.is_file():
             result.append(path)

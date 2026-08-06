@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import logging
+from time import perf_counter
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -18,13 +20,19 @@ from movieclaw_jellyfin.catalog import (
     DtoContext,
     DtoOptions,
     ItemBundle,
+    LatestUnitCandidate,
+    ResumeUnitCandidate,
     episode_dto,
     item_ids_with_files,
+    latest_unit_candidates,
     library_view_dto,
     list_libraries,
     load_bundles,
     load_library_stats,
     movie_dto,
+    movie_library_page,
+    next_up_item_ids,
+    resume_unit_candidates,
     season_dto,
     series_dto,
 )
@@ -46,9 +54,78 @@ from movieclaw_jellyfin.routes.common import (
 from movieclaw_jellyfin.security import require_device
 
 router = APIRouter(dependencies=[Depends(require_device)])
+logger = logging.getLogger("movieclaw_jellyfin.library")
+
+# 正常大库请求应进入亚秒级；只记录越线请求，既保留部署侧定位证据，也避免
+# VidHub 的高频首页轮询淹没访问日志。
+SLOW_BROWSE_REQUEST_MS = 1_000
+
+# 仅记录协议中实际支持且不携带用户内容的字段名。fields 是客户端原样输入，
+# 不能直接写日志：未知字段可能被用来夹带标题、路径或令牌。
+_LOG_SAFE_FIELDS = frozenset(
+    {
+        "ChildCount",
+        "DateCreated",
+        "Genres",
+        "MediaSources",
+        "MediaStreams",
+        "OriginalTitle",
+        "Overview",
+        "ParentId",
+        "Path",
+        "People",
+        "ProviderIds",
+        "RecursiveItemCount",
+        "Studios",
+        "Taglines",
+    }
+)
 
 # (type, bundle, season, episode)：查询管线里的一条候选
 Entry = tuple[str, ItemBundle, int, int]
+
+
+def _logged_field_summary(options: DtoOptions) -> str:
+    """返回不含客户端原始内容的字段摘要，供慢请求日志使用。"""
+    known = sorted(options.fields & _LOG_SAFE_FIELDS)
+    unknown_count = len(options.fields - _LOG_SAFE_FIELDS)
+    if unknown_count:
+        known.append(f"other={unknown_count}")
+    return ",".join(known) or "-"
+
+
+def _log_slow_browse(
+    *,
+    route: str,
+    scope: str,
+    options: DtoOptions,
+    candidates: int,
+    returned: int,
+    load_ms: float,
+    build_ms: float,
+    encode_ms: float,
+    cover_ms: float = 0,
+    started_at: float,
+) -> None:
+    """只为慢首页请求输出脱敏的分段耗时，辅助定位部署环境差异。"""
+    total_ms = (perf_counter() - started_at) * 1000
+    if total_ms < SLOW_BROWSE_REQUEST_MS:
+        return
+    logger.warning(
+        "Jellyfin 媒体库浏览请求较慢：route=%s scope=%s fields=%s "
+        "candidates=%d returned=%d load_ms=%.2f build_ms=%.2f encode_ms=%.2f "
+        "cover_ms=%.2f total_ms=%.2f",
+        route,
+        scope,
+        _logged_field_summary(options),
+        candidates,
+        returned,
+        load_ms,
+        build_ms,
+        encode_ms,
+        cover_ms,
+        total_ms,
+    )
 
 
 async def _items_with_persons(
@@ -272,6 +349,7 @@ def _entry_dto(ctx: DtoContext, entry: Entry, options: DtoOptions) -> dict[str, 
 
 
 async def _query_items(request: Request) -> JSONResponse:
+    started_at = perf_counter()
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -285,11 +363,63 @@ async def _query_items(request: Request) -> JSONResponse:
     parent_raw = q.get("parentId")
     ids_raw = parse_comma(q.get("ids"))
     search_term = q.get("searchTerm")
+    person_ids_raw = parse_comma(q.get("personIds"))
+    start_index = _parse_int(q.get("startIndex"))
+    limit = _parse_int(q.get("limit"), default=-1)
+    sort_by = parse_comma(q.get("sortBy"))
+    sort_order = parse_comma(q.get("sortOrder"))
 
-    include_people = options.has("People")
+    # 电影库的默认列表只需条目 id 和文件存在性；在没有筛选、排序和
+    # personIds 时，数据库即可完成 count/offset/limit，最终页才水合 bundle。
+    simple_movie_page = False
+    simple_total = 0
+
+    load_started_at = perf_counter()
     async with get_database().session() as session:
-        if ids_raw:
-            entries = await _entries_for_ids(session, ids_raw, include_people=include_people)
+        page_entries: list[Entry] | None = None
+        parent_ref = decode_guid(parent_raw or "") if parent_raw else None
+        can_page_movies = (
+            not ids_raw
+            and parent_ref is not None
+            and parent_ref.kind == EntityKind.LIBRARY
+            and include_types in (set(), {"Movie"})
+            and not exclude_types
+            and not search_term
+            and not parse_comma(q.get("years"))
+            and not parse_pipe(q.get("genres"))
+            and not parse_pipe(q.get("officialRatings"))
+            and not parse_comma(q.get("filters"))
+            and parse_bool(q.get("isPlayed")) is None
+            and parse_bool(q.get("isFavorite")) is not True
+            and not person_ids_raw
+            and not sort_by
+            and start_index >= 0
+            and limit >= 0
+        )
+        if can_page_movies and parent_ref is not None:
+            library = await session.get(Library, parent_ref.entity_id)
+            can_page_movies = library is not None and library.kind == "movie"
+        if can_page_movies and parent_ref is not None:
+            simple_total, page_ids = await movie_library_page(
+                session,
+                parent_ref.entity_id,
+                start_index=start_index,
+                limit=limit,
+            )
+            bundles = await load_bundles(
+                session,
+                page_ids,
+                library_id=parent_ref.entity_id,
+                dto_options=options,
+            )
+            page_entries = [
+                ("Movie", bundles[item_id], 0, 0)
+                for item_id in page_ids
+                if item_id in bundles and (0, 0) in bundles[item_id].files
+            ]
+            simple_movie_page = True
+        elif ids_raw:
+            entries = await _entries_for_ids(session, ids_raw, options=options)
         else:
             entries = await _entries_for_parent(
                 session,
@@ -297,76 +427,112 @@ async def _query_items(request: Request) -> JSONResponse:
                 include_types=include_types,
                 recursive=recursive,
                 has_search=bool(search_term),
-                include_people=include_people,
+                options=options,
             )
             if entries is None:
                 # 根级：返回视图列表
                 libraries = await list_libraries(session)
                 stats = await load_library_stats(session)
+                load_ms = (perf_counter() - load_started_at) * 1000
+                cover_started_at = perf_counter()
                 dtos = [
                     library_view_dto(
                         ctx, lib, stats.get(lib.id), await _cover_tag(lib.id)
                     )
                     for lib in libraries
                 ]
-                return JSONResponse(query_result(dtos, len(dtos)))
+                cover_ms = (perf_counter() - cover_started_at) * 1000
+                response_started_at = perf_counter()
+                response = JSONResponse(query_result(dtos, len(dtos)))
+                _log_slow_browse(
+                    route="items",
+                    scope="root",
+                    options=options,
+                    candidates=len(libraries),
+                    returned=len(dtos),
+                    load_ms=load_ms,
+                    build_ms=0,
+                    encode_ms=(perf_counter() - response_started_at) * 1000,
+                    cover_ms=cover_ms,
+                    started_at=started_at,
+                )
+                return response
 
-        person_ids_raw = parse_comma(q.get("personIds"))
-        if person_ids_raw:
+        if not simple_movie_page and person_ids_raw:
             member_ids = await _items_with_persons(session, person_ids_raw)
             entries = [e for e in entries if e[1].item.id in member_ids]
+    load_ms = (perf_counter() - load_started_at) * 1000
+    build_started_at = perf_counter()
 
-    if exclude_types:
-        entries = [e for e in entries if e[0] not in exclude_types]
+    if simple_movie_page:
+        entries = page_entries or []
+        total = simple_total
+        page = entries
+    else:
+        if exclude_types:
+            entries = [e for e in entries if e[0] not in exclude_types]
 
-    # ---- 过滤 -------------------------------------------------------------
-    if search_term:
-        entries = [e for e in entries if _search_match(e[1], search_term)]
-    years = {int(y) for y in parse_comma(q.get("years")) if y.isdigit()}
-    if years:
-        entries = [e for e in entries if e[1].item.year in years]
-    genres = set(parse_pipe(q.get("genres")))
-    if genres:
-        entries = [
-            e
-            for e in entries
-            if e[1].metadata and genres & set(e[1].metadata.genres or [])
-        ]
-    ratings = set(parse_pipe(q.get("officialRatings")))
-    if ratings:
-        entries = [
-            e for e in entries if e[1].metadata and e[1].metadata.content_rating in ratings
-        ]
+        # ---- 过滤 ---------------------------------------------------------
+        if search_term:
+            entries = [e for e in entries if _search_match(e[1], search_term)]
+        years = {int(y) for y in parse_comma(q.get("years")) if y.isdigit()}
+        if years:
+            entries = [e for e in entries if e[1].item.year in years]
+        genres = set(parse_pipe(q.get("genres")))
+        if genres:
+            entries = [
+                e
+                for e in entries
+                if e[1].metadata and genres & set(e[1].metadata.genres or [])
+            ]
+        ratings = set(parse_pipe(q.get("officialRatings")))
+        if ratings:
+            entries = [
+                e
+                for e in entries
+                if e[1].metadata and e[1].metadata.content_rating in ratings
+            ]
 
-    filters = set(parse_comma(q.get("filters")))
-    is_played = parse_bool(q.get("isPlayed"))
-    if "IsPlayed" in filters or is_played is True:
-        entries = [e for e in entries if _entry_played(e)]
-    if "IsUnplayed" in filters or is_played is False:
-        entries = [e for e in entries if not _entry_played(e)]
-    if "IsResumable" in filters:
-        entries = [e for e in entries if _entry_resumable(e)]
-    if "IsFavorite" in filters or parse_bool(q.get("isFavorite")) is True:
-        entries = [e for e in entries if _entry_favorite(e)]
+        filters = set(parse_comma(q.get("filters")))
+        is_played = parse_bool(q.get("isPlayed"))
+        if "IsPlayed" in filters or is_played is True:
+            entries = [e for e in entries if _entry_played(e)]
+        if "IsUnplayed" in filters or is_played is False:
+            entries = [e for e in entries if not _entry_played(e)]
+        if "IsResumable" in filters:
+            entries = [e for e in entries if _entry_resumable(e)]
+        if "IsFavorite" in filters or parse_bool(q.get("isFavorite")) is True:
+            entries = [e for e in entries if _entry_favorite(e)]
 
-    # ---- 排序 / 分页 / DTO -------------------------------------------------
-    entries = _sort_entries(
-        entries, parse_comma(q.get("sortBy")), parse_comma(q.get("sortOrder"))
-    )
-    total = len(entries)
-    start_index = _parse_int(q.get("startIndex"))
-    limit = _parse_int(q.get("limit"), default=-1)
-    page = entries[start_index : start_index + limit] if limit >= 0 else entries[start_index:]
+        # ---- 排序 / 分页 / DTO -------------------------------------------
+        entries = _sort_entries(entries, sort_by, sort_order)
+        total = len(entries)
+        page = entries[start_index : start_index + limit] if limit >= 0 else entries[start_index:]
+
     dtos = [_entry_dto(ctx, e, options) for e in page]
-    return JSONResponse(query_result(dtos, total, start_index))
+    build_ms = (perf_counter() - build_started_at) * 1000
+    response_started_at = perf_counter()
+    response = JSONResponse(query_result(dtos, total, start_index))
+    _log_slow_browse(
+        route="items",
+        scope="ids" if ids_raw else ("parent" if parent_raw else "root"),
+        options=options,
+        candidates=total,
+        returned=len(dtos),
+        load_ms=load_ms,
+        build_ms=build_ms,
+        encode_ms=(perf_counter() - response_started_at) * 1000,
+        started_at=started_at,
+    )
+    return response
 
 
 async def _entries_for_ids(
-    session: AsyncSession, ids_raw: list[str], *, include_people: bool = False
+    session: AsyncSession, ids_raw: list[str], *, options: DtoOptions
 ) -> list[Entry]:
     refs = [r for r in (decode_guid(i) for i in ids_raw) if r is not None]
     scoped = {r.entity_id for r in refs if r.kind != EntityKind.LIBRARY}
-    bundles = await load_bundles(session, list(scoped), include_people=include_people)
+    bundles = await load_bundles(session, list(scoped), dto_options=options)
     entries: list[Entry] = []
     for ref in refs:
         bundle = bundles.get(ref.entity_id)
@@ -390,7 +556,7 @@ async def _entries_for_parent(
     include_types: set[str],
     recursive: bool | None,
     has_search: bool,
-    include_people: bool = False,
+    options: DtoOptions,
 ) -> list[Entry] | None:
     """按 parentId 语义展开候选。返回 None 表示"根级 → 视图列表"。"""
     if not parent_raw or is_empty_guid(parent_raw):
@@ -398,7 +564,7 @@ async def _entries_for_parent(
             # 无 parent 的全局搜索/类型查询：跨全部库递归
             types = include_types or {"Movie", "Series"}
             ids = await item_ids_with_files(session)
-            bundles = await load_bundles(session, ids, include_people=include_people)
+            bundles = await load_bundles(session, ids, dto_options=options)
             return _build_entries(bundles, types)
         return None
 
@@ -427,17 +593,17 @@ async def _entries_for_parent(
             types = (include_types & default_types) if include_types else default_types
         ids = await item_ids_with_files(session, library_id=ref.entity_id)
         bundles = await load_bundles(
-            session, ids, library_id=ref.entity_id, include_people=include_people
+            session, ids, library_id=ref.entity_id, dto_options=options
         )
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.ITEM:
-        bundles = await load_bundles(session, [ref.entity_id], include_people=include_people)
+        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
         types = include_types or {"Season"}
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.SEASON:
-        bundles = await load_bundles(session, [ref.entity_id], include_people=include_people)
+        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
         return _build_entries(bundles, {"Episode"}, season_scope=ref.season)
 
     raise not_found()
@@ -462,6 +628,7 @@ async def items_latest(
     limit: int = Query(default=20),
     groupItems: bool = Query(default=True),  # noqa: N803 —— 对齐协议参数名
 ) -> JSONResponse:
+    started_at = perf_counter()
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -479,57 +646,82 @@ async def items_latest(
     if is_played is None:
         is_played = False  # HidePlayedInLatest=True 的默认语义
 
+    load_started_at = perf_counter()
     async with get_database().session() as session:
-        ids = await item_ids_with_files(session, library_id=library_id)
-        bundles = await load_bundles(
-            session, ids, library_id=library_id, include_people=options.has("People")
+        # 先读每个最新单元的 5 个标量列；只有通过 limit/groupItems 的最终
+        # 条目才进入 load_bundles。这样 1200 部电影不会先水合整库 JSON。
+        latest_units = await latest_unit_candidates(
+            session, library_id=library_id, is_played=is_played
         )
+        selected_units: list[LatestUnitCandidate] = []
+        grouped_series: dict[int, int] = {}
+        for candidate in latest_units:
+            if len(selected_units) >= limit:
+                break
+            if candidate.kind == "movie":
+                selected_units.append(candidate)
+                continue
+            # 剧集：两态简化（设计文档偏离⑥），同剧多集新入库聚合为 Series。
+            if not groupItems:
+                selected_units.append(candidate)
+                continue
+            if candidate.media_item_id in grouped_series:
+                grouped_series[candidate.media_item_id] += 1
+                continue
+            grouped_series[candidate.media_item_id] = 1
+            selected_units.append(candidate)
 
-    # 每个"最新单元"= 文件入库时间最大的 (bundle, season, episode)
-    latest_units: list[tuple[Any, ItemBundle, int, int]] = []
-    for bundle in bundles.values():
-        for (season, episode), files in bundle.files.items():
-            created = max(f.created_at for f in files)
-            latest_units.append((created, bundle, season, episode))
-    latest_units.sort(key=lambda t: t[0], reverse=True)
+        selected_ids = list(dict.fromkeys(c.media_item_id for c in selected_units))
+        bundles = await load_bundles(
+            session,
+            selected_ids,
+            library_id=library_id,
+            dto_options=options,
+        )
+    load_ms = (perf_counter() - load_started_at) * 1000
+    build_started_at = perf_counter()
 
     dtos: list[dict[str, Any]] = []
-    grouped_series: dict[int, int] = {}
-    for _created, bundle, season, episode in latest_units:
-        if len(dtos) >= limit:
-            break
-        if bundle.item.kind == "movie":
-            entry: Entry = ("Movie", bundle, 0, 0)
-            if is_played is not None and _entry_played(entry) is not is_played:
-                continue
+    dto_candidates: list[LatestUnitCandidate] = []
+    for candidate in selected_units:
+        bundle = bundles.get(candidate.media_item_id)
+        if bundle is None:
+            continue
+        season = candidate.season_number
+        episode = candidate.episode_number
+        if candidate.kind == "movie":
             dtos.append(movie_dto(ctx, bundle, options))
-            continue
-        # 剧集：两态简化（设计文档偏离⑥）——同剧多集新入库聚合为 Series
-        entry = ("Episode", bundle, season, episode)
-        if is_played is not None and _entry_played(entry) is not is_played:
-            continue
-        if not groupItems:
+        else:
             dtos.append(episode_dto(ctx, bundle, season, episode, options))
-            continue
-        if bundle.item.id in grouped_series:
-            grouped_series[bundle.item.id] += 1
-            continue
-        grouped_series[bundle.item.id] = 1
-        dtos.append(episode_dto(ctx, bundle, season, episode, options))
+        dto_candidates.append(candidate)
 
     if groupItems:
         # 同剧 ≥2 个新单元 → 用 Series 条目替换该剧的 Episode 占位
-        for i, dto in enumerate(dtos):
+        for i, (candidate, dto) in enumerate(zip(dto_candidates, dtos, strict=True)):
             if dto.get("Type") != "Episode":
                 continue
-            ref = decode_guid(dto["SeriesId"])
-            if ref and grouped_series.get(ref.entity_id, 0) > 1:
-                bundle = bundles[ref.entity_id]
+            count = grouped_series.get(candidate.media_item_id, 0)
+            if count > 1:
+                bundle = bundles[candidate.media_item_id]
                 series = series_dto(ctx, bundle, options)
-                series["ChildCount"] = grouped_series[ref.entity_id]
+                series["ChildCount"] = count
                 dtos[i] = series
 
-    return JSONResponse(dtos)
+    build_ms = (perf_counter() - build_started_at) * 1000
+    response_started_at = perf_counter()
+    response = JSONResponse(dtos)
+    _log_slow_browse(
+        route="latest",
+        scope="parent" if library_id is not None else "all_libraries",
+        options=options,
+        candidates=len(latest_units),
+        returned=len(dtos),
+        load_ms=load_ms,
+        build_ms=build_ms,
+        encode_ms=(perf_counter() - response_started_at) * 1000,
+        started_at=started_at,
+    )
+    return response
 
 
 @router.get("/UserItems/Resume")
@@ -543,29 +735,44 @@ async def items_resume(request: Request, user_id: str | None = None) -> JSONResp
         enable_images=q.get("enableImages"),
     )
     media_types = set(parse_comma(q.get("mediaTypes")))
-
-    async with get_database().session() as session:
-        ids = await item_ids_with_files(session)
-        bundles = await load_bundles(session, ids, include_people=options.has("People"))
-
-    entries = _build_entries(bundles, {"Movie", "Episode"})
-    if media_types and "Video" not in media_types:
-        entries = []
-    # 服务端强制语义：可续播 = 位置 > 0；按最近播放降序（客户端不可覆盖）
-    resumable = [e for e in entries if _entry_resumable(e)]
-    resumable.sort(
-        key=lambda e: e[1].state(e[2], e[3]).last_played_at or e[1].item.created_at,
-        reverse=True,
-    )
-
-    total = len(resumable)
     start_index = _parse_int(q.get("startIndex"))
     limit = _parse_int(q.get("limit"), default=-1)
-    page = (
-        resumable[start_index : start_index + limit]
-        if limit >= 0
-        else resumable[start_index:]
-    )
+    candidates: list[ResumeUnitCandidate] = []
+    if not media_types or "Video" in media_types:
+        async with get_database().session() as session:
+            # 播放状态表通常远小于媒体库；只为有续播点的单元查询 bundle。
+            candidates = await resume_unit_candidates(session)
+            page_candidates = (
+                candidates[start_index : start_index + limit]
+                if limit >= 0
+                else candidates[start_index:]
+            )
+            selected_ids = list(dict.fromkeys(c.media_item_id for c in page_candidates))
+            bundles = await load_bundles(session, selected_ids, dto_options=options)
+    else:
+        page_candidates = []
+        bundles = {}
+
+    # 服务端强制语义：可续播 = 位置 > 0；候选查询已按最近活动降序排列。
+    page: list[Entry] = []
+    for candidate in page_candidates:
+        bundle = bundles.get(candidate.media_item_id)
+        if bundle is None:
+            continue
+        if bundle.item.kind == "movie":
+            if (0, 0) in bundle.files:
+                page.append(("Movie", bundle, 0, 0))
+        elif (candidate.season_number, candidate.episode_number) in bundle.files:
+            page.append(
+                (
+                    "Episode",
+                    bundle,
+                    candidate.season_number,
+                    candidate.episode_number,
+                )
+            )
+
+    total = len(candidates)
     dtos = [_entry_dto(ctx, e, options) for e in page]
     return JSONResponse(query_result(dtos, total, start_index))
 
@@ -697,7 +904,7 @@ async def get_item(request: Request, item_id: str, user_id: str | None = None) -
                 )
             )
         # 单条目是全字段语义，People 恒输出
-        bundles = await load_bundles(session, [ref.entity_id], include_people=True)
+        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
 
     bundle = bundles.get(ref.entity_id)
     if bundle is None:
@@ -741,8 +948,11 @@ async def shows_next_up(request: Request) -> JSONResponse:
     series_filter = decode_guid(q.get("seriesId") or "") if q.get("seriesId") else None
 
     async with get_database().session() as session:
-        ids = await item_ids_with_files(session, kind="tv")
-        bundles = await load_bundles(session, ids, include_people=options.has("People"))
+        ids = await next_up_item_ids(
+            session,
+            series_id=series_filter.entity_id if series_filter else None,
+        )
+        bundles = await load_bundles(session, ids, dto_options=options)
 
     candidates: list[tuple[Any, dict[str, Any]]] = []
     for bundle in bundles.values():
@@ -801,9 +1011,7 @@ async def shows_seasons(request: Request, series_id: str) -> JSONResponse:
     if ref is None or ref.kind != EntityKind.ITEM:
         raise not_found()
     async with get_database().session() as session:
-        bundles = await load_bundles(
-            session, [ref.entity_id], include_people=options.has("People")
-        )
+        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
     bundle = bundles.get(ref.entity_id)
     if bundle is None or bundle.item.kind != "tv":
         raise not_found()
@@ -843,9 +1051,7 @@ async def shows_episodes(request: Request, series_id: str) -> JSONResponse:
             season_scope = int(season_param)
 
     async with get_database().session() as session:
-        bundles = await load_bundles(
-            session, [target_item_id], include_people=options.has("People")
-        )
+        bundles = await load_bundles(session, [target_item_id], dto_options=options)
     bundle = bundles.get(target_item_id)
     if bundle is None or bundle.item.kind != "tv":
         raise not_found_message("Series not found")

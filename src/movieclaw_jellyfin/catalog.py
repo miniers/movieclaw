@@ -7,8 +7,9 @@
     Episode = media_episode ⋈ library_file（(item, season, episode) 数字对）
 
 只输出"有文件"的内容：missing_since 非空或未识别（media_item_id NULL）的
-文件行不进任何列表。规模假设是家用 NAS（万级条目），过滤/排序/分页在
-内存完成——SQL 只做粗筛，正确性优先于极限吞吐。
+文件行不进任何列表。复杂 Jellyfin 筛选/排序仍在内存完成；首页高频的
+电影列表、Latest 与播放状态查询先在 SQL 取轻量候选，最后才水合 bundle。
+这样在不牺牲兼容性的前提下避免读取整库详情 JSON。
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import load_only
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from movieclaw_db.models import (
@@ -106,12 +108,134 @@ class ItemBundle:
         return None
 
 
+@dataclass(frozen=True)
+class LatestUnitCandidate:
+    """Latest 的轻量候选行；只含排序、分组和播放过滤所需字段。"""
+
+    created_at: datetime
+    media_item_id: int
+    kind: str
+    season_number: int
+    episode_number: int
+
+
+@dataclass(frozen=True)
+class ResumeUnitCandidate:
+    """Resume 的轻量候选行，避免为未进入分页的条目水合完整 bundle。"""
+
+    media_item_id: int
+    season_number: int
+    episode_number: int
+
+
+def _list_load_columns(
+    options: DtoOptions,
+) -> tuple[list[Any], list[Any], list[Any], list[Any], list[Any]]:
+    """列举列表 DTO、筛选和排序真正会读取的列。
+
+    ``load_bundles`` 的结果会在 session 关闭后才构建 DTO，不能依赖 SQLAlchemy
+    的惰性加载；因此这个列集必须覆盖所有列表路径。演员档案、媒体流 JSON 等
+    大字段只在客户端明确请求时加入，避免大库首页白白反序列化数千段 JSON。
+    """
+    item_columns = [
+        MediaItem.id,
+        MediaItem.kind,
+        MediaItem.tmdb_id,
+        MediaItem.imdb_id,
+        MediaItem.title,
+        MediaItem.original_title,
+        MediaItem.year,
+        MediaItem.aliases,
+        MediaItem.status,
+        MediaItem.created_at,
+    ]
+    metadata_columns = [
+        MediaMetadata.id,
+        MediaMetadata.media_item_id,
+        MediaMetadata.content_rating,
+        MediaMetadata.vote_average,
+        MediaMetadata.release_date,
+        MediaMetadata.runtime_minutes,
+        MediaMetadata.genres,
+    ]
+    if options.enable_images:
+        metadata_columns.extend(
+            [
+                MediaMetadata.poster_file,
+                MediaMetadata.backdrop_file,
+                MediaMetadata.updated_at,
+            ]
+        )
+    if options.has("Overview"):
+        metadata_columns.append(MediaMetadata.overview)
+    if options.has("Studios"):
+        metadata_columns.append(MediaMetadata.studios)
+    if options.has("Taglines"):
+        metadata_columns.append(MediaMetadata.tagline)
+
+    file_columns = [
+        LibraryFile.id,
+        LibraryFile.media_item_id,
+        LibraryFile.season_number,
+        LibraryFile.episode_number,
+        LibraryFile.duration_seconds,
+        LibraryFile.created_at,
+    ]
+    if options.has("ParentId"):
+        file_columns.append(LibraryFile.library_id)
+    if options.has("MediaSources") or options.has("MediaStreams"):
+        file_columns.extend(
+            [
+                LibraryFile.file_path,
+                LibraryFile.size_bytes,
+                LibraryFile.file_mtime_ns,
+                LibraryFile.container,
+                LibraryFile.resolution,
+                LibraryFile.video_codec,
+                LibraryFile.hdr,
+                LibraryFile.bit_depth,
+                LibraryFile.bit_rate,
+                LibraryFile.audio_streams,
+                LibraryFile.subtitle_streams,
+            ]
+        )
+    elif options.has("Path"):
+        file_columns.append(LibraryFile.file_path)
+
+    season_columns = [
+        MediaSeason.id,
+        MediaSeason.media_item_id,
+        MediaSeason.season_number,
+        MediaSeason.name,
+        MediaSeason.air_date,
+    ]
+    if options.enable_images:
+        season_columns.extend([MediaSeason.poster_file, MediaSeason.updated_at])
+
+    episode_columns = [
+        MediaEpisode.id,
+        MediaEpisode.media_item_id,
+        MediaEpisode.season_number,
+        MediaEpisode.episode_number,
+        MediaEpisode.name,
+        MediaEpisode.air_date,
+        MediaEpisode.runtime_minutes,
+        MediaEpisode.vote_average,
+    ]
+    if options.enable_images:
+        episode_columns.extend([MediaEpisode.still_file, MediaEpisode.updated_at])
+    if options.has("Overview"):
+        episode_columns.append(MediaEpisode.overview)
+    return item_columns, metadata_columns, file_columns, season_columns, episode_columns
+
+
 async def load_bundles(
     session: AsyncSession,
     item_ids: list[int],
     *,
     library_id: int | None = None,
     include_people: bool = False,
+    dto_options: DtoOptions | None = None,
 ) -> dict[int, ItemBundle]:
     """批量装载条目素材。library_id 限定时只装该库的文件行。
 
@@ -119,22 +243,36 @@ async def load_bundles(
     单条目全字段）：演职员是量最大的关联（条目数 × 十余人的 join +
     ORM 水合），列表请求默认不带 fields=People，装了也是白装——1200 部
     电影的库这一项就要秒级开销（issue #88）。
+
+    ``dto_options`` 仅由列表接口传入。它触发最小列集读取，避免列表在不输出
+    演员、音轨和字幕时仍反序列化这些大 JSON 列；全字段详情和未迁移的调用
+    保持原有整行读取语义。
     """
     if not item_ids:
         return {}
+    summary_columns = (
+        _list_load_columns(dto_options)
+        if dto_options is not None and not dto_options.all_fields
+        else None
+    )
+    if dto_options is not None:
+        include_people = include_people or dto_options.has("People")
+
+    item_q = select(MediaItem).where(MediaItem.id.in_(item_ids))
+    if summary_columns is not None:
+        item_q = item_q.options(load_only(*summary_columns[0]))
     items = (
-        (await session.execute(select(MediaItem).where(MediaItem.id.in_(item_ids))))
+        (await session.execute(item_q))
         .scalars()
         .all()
     )
     bundles = {i.id: ItemBundle(item=i) for i in items}
 
+    metadata_q = select(MediaMetadata).where(MediaMetadata.media_item_id.in_(item_ids))
+    if summary_columns is not None:
+        metadata_q = metadata_q.options(load_only(*summary_columns[1]))
     metas = (
-        (
-            await session.execute(
-                select(MediaMetadata).where(MediaMetadata.media_item_id.in_(item_ids))
-            )
-        )
+        (await session.execute(metadata_q))
         .scalars()
         .all()
     )
@@ -148,6 +286,8 @@ async def load_bundles(
     )
     if library_id is not None:
         file_q = file_q.where(LibraryFile.library_id == library_id)
+    if summary_columns is not None:
+        file_q = file_q.options(load_only(*summary_columns[2]))
     for f in (await session.execute(file_q)).scalars():
         b = bundles.get(f.media_item_id)
         if b is not None:
@@ -155,17 +295,15 @@ async def load_bundles(
 
     tv_ids = [i.id for i in items if i.kind == "tv"]
     if tv_ids:
-        for s in (
-            await session.execute(
-                select(MediaSeason).where(MediaSeason.media_item_id.in_(tv_ids))
-            )
-        ).scalars():
+        season_q = select(MediaSeason).where(MediaSeason.media_item_id.in_(tv_ids))
+        if summary_columns is not None:
+            season_q = season_q.options(load_only(*summary_columns[3]))
+        for s in (await session.execute(season_q)).scalars():
             bundles[s.media_item_id].seasons[s.season_number] = s
-        for e in (
-            await session.execute(
-                select(MediaEpisode).where(MediaEpisode.media_item_id.in_(tv_ids))
-            )
-        ).scalars():
+        episode_q = select(MediaEpisode).where(MediaEpisode.media_item_id.in_(tv_ids))
+        if summary_columns is not None:
+            episode_q = episode_q.options(load_only(*summary_columns[4]))
+        for e in (await session.execute(episode_q)).scalars():
             bundles[e.media_item_id].episodes[(e.season_number, e.episode_number)] = e
 
     for st in (
@@ -198,6 +336,194 @@ async def load_bundles(
 
     # 没有任何在位文件的条目不对外呈现
     return {k: v for k, v in bundles.items() if v.files}
+
+
+async def latest_unit_candidates(
+    session: AsyncSession,
+    *,
+    library_id: int | None = None,
+    is_played: bool | None = None,
+) -> list[LatestUnitCandidate]:
+    """只查询 Latest 的排序单元，延后到选页后再装载 bundle。
+
+    旧路径先把整个库的 ``MediaItem``、元数据、文件和播放状态全部水合，
+    然后才按 ``created_at`` 排序并取 20 条。这里把同一条目/季/集的文件
+    聚合成一行，播放状态也在数据库侧筛掉；返回固定的小标量列，不会
+    触发列表 DTO 不需要的 JSON 反序列化。``min(file.id)`` 只用于复现旧
+    路径在入库时间相同的情况下的稳定顺序，不参与业务语义。
+    """
+    latest_created = func.max(LibraryFile.created_at).label("latest_created")
+    q = (
+        select(
+            LibraryFile.media_item_id,
+            LibraryFile.season_number,
+            LibraryFile.episode_number,
+            MediaItem.kind,
+            latest_created,
+        )
+        .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)
+        .where(
+            LibraryFile.media_item_id.is_not(None),
+            LibraryFile.missing_since.is_(None),
+        )
+    )
+    if library_id is not None:
+        q = q.where(LibraryFile.library_id == library_id)
+    if is_played is not None:
+        q = q.outerjoin(
+            PlaybackState,
+            and_(
+                PlaybackState.media_item_id == LibraryFile.media_item_id,
+                PlaybackState.season_number == LibraryFile.season_number,
+                PlaybackState.episode_number == LibraryFile.episode_number,
+            ),
+        )
+        if is_played:
+            q = q.where(PlaybackState.played.is_(True))
+        else:
+            q = q.where(
+                or_(PlaybackState.id.is_(None), PlaybackState.played.is_(False))
+            )
+    q = q.group_by(
+        LibraryFile.media_item_id,
+        LibraryFile.season_number,
+        LibraryFile.episode_number,
+        MediaItem.kind,
+    ).order_by(
+        latest_created.desc(),
+        func.min(LibraryFile.id).asc(),
+        LibraryFile.media_item_id.asc(),
+        LibraryFile.season_number.asc(),
+        LibraryFile.episode_number.asc(),
+    )
+    rows = (await session.execute(q)).all()
+    return [
+        LatestUnitCandidate(
+            created_at=row.latest_created,
+            media_item_id=row.media_item_id,
+            kind=row.kind,
+            season_number=row.season_number,
+            episode_number=row.episode_number,
+        )
+        for row in rows
+    ]
+
+
+async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandidate]:
+    """查询有续播位置且文件仍在位的单元，不加载未进入结果页的 bundle。"""
+    file_exists = (
+        select(LibraryFile.id)
+        .where(
+            LibraryFile.media_item_id == PlaybackState.media_item_id,
+            LibraryFile.season_number == PlaybackState.season_number,
+            LibraryFile.episode_number == PlaybackState.episode_number,
+            LibraryFile.missing_since.is_(None),
+        )
+        .exists()
+    )
+    q = (
+        select(
+            PlaybackState.media_item_id,
+            PlaybackState.season_number,
+            PlaybackState.episode_number,
+        )
+        .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
+        .where(
+            PlaybackState.position_ms > 0,
+            file_exists,
+            or_(
+                and_(
+                    MediaItem.kind == "movie",
+                    PlaybackState.season_number == 0,
+                    PlaybackState.episode_number == 0,
+                ),
+                MediaItem.kind == "tv",
+            ),
+        )
+        .order_by(
+            func.coalesce(PlaybackState.last_played_at, MediaItem.created_at).desc(),
+            PlaybackState.media_item_id.asc(),
+            PlaybackState.season_number.asc(),
+            PlaybackState.episode_number.asc(),
+        )
+    )
+    rows = (await session.execute(q)).all()
+    return [
+        ResumeUnitCandidate(
+            media_item_id=row.media_item_id,
+            season_number=row.season_number,
+            episode_number=row.episode_number,
+        )
+        for row in rows
+    ]
+
+
+async def next_up_item_ids(
+    session: AsyncSession, *, series_id: int | None = None
+) -> list[int]:
+    """返回有在位文件和播放活动的剧集 id，供 NextUp 延后加载。"""
+    file_exists = (
+        select(LibraryFile.id)
+        .where(
+            LibraryFile.media_item_id == PlaybackState.media_item_id,
+            LibraryFile.season_number == PlaybackState.season_number,
+            LibraryFile.episode_number == PlaybackState.episode_number,
+            LibraryFile.missing_since.is_(None),
+        )
+        .exists()
+    )
+    q = (
+        select(PlaybackState.media_item_id)
+        .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
+        .where(
+            MediaItem.kind == "tv",
+            PlaybackState.season_number != 0,
+            or_(PlaybackState.played.is_(True), PlaybackState.position_ms > 0),
+            file_exists,
+        )
+        .distinct()
+        .order_by(PlaybackState.media_item_id.asc())
+    )
+    if series_id is not None:
+        q = q.where(PlaybackState.media_item_id == series_id)
+    return list((await session.execute(q)).scalars())
+
+
+async def movie_library_page(
+    session: AsyncSession,
+    library_id: int,
+    *,
+    start_index: int,
+    limit: int,
+) -> tuple[int, list[int]]:
+    """电影库无筛选列表的 SQL 计数和分页，只返回最终要装载的条目 id。"""
+    file_exists = (
+        select(LibraryFile.id)
+        .where(
+            LibraryFile.library_id == library_id,
+            LibraryFile.media_item_id == MediaItem.id,
+            LibraryFile.season_number == 0,
+            LibraryFile.episode_number == 0,
+            LibraryFile.missing_since.is_(None),
+        )
+        .exists()
+    )
+    condition = and_(MediaItem.kind == "movie", file_exists)
+    total = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(MediaItem).where(condition)
+            )
+        ).scalar_one()
+    )
+    q = (
+        select(MediaItem.id)
+        .where(condition)
+        .order_by(MediaItem.id.asc())
+        .offset(start_index)
+        .limit(limit)
+    )
+    return total, list((await session.execute(q)).scalars())
 
 
 async def item_ids_with_files(
@@ -467,7 +793,8 @@ def movie_dto(ctx: DtoContext, bundle: ItemBundle, options: DtoOptions) -> dict[
     _apply_metadata_fields(dto, bundle, options)
     _apply_provider_ids(dto, bundle, options)
     _apply_item_images(dto, ctx, bundle, options)
-    _apply_parent_id(dto, _item_library_guid(bundle), options)
+    if options.has("ParentId"):
+        _apply_parent_id(dto, _item_library_guid(bundle), options)
     _apply_people(dto, bundle, options)
     if options.has("Path"):
         files = bundle.files.get((0, 0), [])
@@ -504,7 +831,8 @@ def series_dto(ctx: DtoContext, bundle: ItemBundle, options: DtoOptions) -> dict
     _apply_metadata_fields(dto, bundle, options)
     _apply_provider_ids(dto, bundle, options)
     _apply_item_images(dto, ctx, bundle, options)
-    _apply_parent_id(dto, _item_library_guid(bundle), options)
+    if options.has("ParentId"):
+        _apply_parent_id(dto, _item_library_guid(bundle), options)
     _apply_people(dto, bundle, options)
     if options.has("ChildCount"):
         dto["ChildCount"] = len({s for s, _ in bundle.units})
@@ -581,7 +909,7 @@ def episode_dto(
     runtime_ms = bundle.unit_runtime_ms(season, episode)
     if runtime_ms:
         dto["RunTimeTicks"] = runtime_ms * TICKS_PER_MS
-    if row and row.overview and options.has("Overview"):
+    if options.has("Overview") and row and row.overview:
         dto["Overview"] = row.overview
     if row and row.vote_average and row.vote_average > 0:
         dto["CommunityRating"] = round(row.vote_average, 1)
