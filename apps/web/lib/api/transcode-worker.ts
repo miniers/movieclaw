@@ -13,18 +13,17 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
 }
 
 export type RemoteTranscodeBaseUrlSource =
+  /** 网页「高级」里填了覆盖地址。 */
   | "remote_transcode_setting"
-  | "system_external_url"
-  | "unset"
+  /** 默认：取源/回传用接单 Worker 自己连上来的地址，没有静态值。 */
+  | "worker_connection"
   | string;
 
 export interface RemoteTranscodeConfigView {
   enabled: boolean;
-  /** 仅返回是否已配置，不返回 Worker Token 明文。 */
-  worker_token_configured: boolean;
-  /** 实际使用的远程转码根地址。 */
+  /** 静态配置出的远程转码根地址；为空表示自动跟随 Worker 连上来的地址。 */
   base_url: string;
-  /** 网页配置的远程转码专用地址；为空时跟随系统外部访问地址。 */
+  /** 网页配置的远程转码专用地址覆盖项；为空表示不覆盖。 */
   base_url_override: string;
   base_url_source: RemoteTranscodeBaseUrlSource;
   max_artifact_bytes: number;
@@ -34,10 +33,8 @@ export interface RemoteTranscodeConfigView {
 
 export interface RemoteTranscodeConfigPayload {
   enabled: boolean;
-  /** null=保持当前专用地址，空字符串=清除并回退系统外部访问地址。 */
+  /** null=保持当前专用地址，空字符串=清除覆盖、回到自动。 */
   base_url?: string | null;
-  /** null=保持当前令牌，空字符串=清除令牌。 */
-  worker_token?: string | null;
   max_artifact_bytes: number;
 }
 
@@ -95,33 +92,3 @@ export function getRemoteTranscodeStatus(): Promise<RemoteTranscodeStatus> {
   );
 }
 
-/** 配对码前缀，必须与 macOS Worker 的 PairingCode.prefix 一致。 */
-const PAIRING_CODE_PREFIX = "movieclaw-worker-v1.";
-
-/**
- * 在浏览器本地拼出配对码，供用户粘贴到 Worker App。
- *
- * 刻意不做成接口：配对码含 Token 明文，等价于凭据本身。页面只在用户刚生成或
- * 刚输入 Token 的那一刻手里有明文，此时本地拼装即可，服务端因此仍然可以坚持
- * 「令牌只写不读」——没有任何接口能把它读回来。
- */
-export function buildPairingCode(baseURL: string, token: string): string {
-  const payload = JSON.stringify({ url: baseURL, token });
-  // TextEncoder + btoa：直接 btoa 处理非 ASCII 会抛错，地址里可能有非 ASCII 主机名
-  const bytes = new TextEncoder().encode(payload);
-  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
-  const base64url = btoa(binary)
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
-  return PAIRING_CODE_PREFIX + base64url;
-}
-
-/** 生成一个高熵 Worker Token。 */
-export function generateWorkerToken(): string {
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  // base64url：可双击全选、不含容易被终端或聊天工具转义的字符
-  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}

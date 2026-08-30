@@ -44,21 +44,13 @@ struct WorkerConfiguration: Sendable {
         let nasURL = try normalizedNASURL(nasText)
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedToken.isEmpty else {
-            throw ConfigurationError.message("Worker Token 不能为空")
-        }
-        let trimmedID = workerID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmedID.range(of: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$", options: .regularExpression) != nil else {
-            throw ConfigurationError.message("Worker ID 只能包含字母、数字、下划线、点、冒号和短横线")
-        }
-        let path = ffmpegPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else {
-            throw ConfigurationError.message("Jellyfin-ffmpeg 路径不能为空")
+            throw ConfigurationError.message("这台 Mac 还没有配对，请在设置里完成配对")
         }
         return WorkerConfiguration(
             nasURL: nasURL,
             workerToken: trimmedToken,
-            workerID: trimmedID,
-            ffmpegPath: path,
+            workerID: try validatedWorkerID(workerID),
+            ffmpegPath: try validatedFFmpegPath(ffmpegPath),
             maxJobs: maxJobs
         )
     }
@@ -86,7 +78,26 @@ struct WorkerConfiguration: Sendable {
 
     static func defaultWorkerID() -> String {
         let name = Host.current().localizedName ?? "mac-worker"
-        return name.replacingOccurrences(of: " ", with: "-")
+        return sanitizedWorkerID(name)
+    }
+
+    /// 把机器名收敛成 validatedWorkerID 能接受的形状。
+    ///
+    /// 只替换空格是不够的：中文环境下 Mac 默认就叫「张三的Mac mini」，
+    /// 「的」过不了 ASCII 白名单，首次打开点「连接并配对」就会被拦下，
+    /// 而用户完全没改过这个字段，根本想不到问题出在机器名上。
+    static func sanitizedWorkerID(_ name: String) -> String {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-")
+        var result = String(name.map { allowed.contains($0) ? $0 : "-" })
+        while result.contains("--") {
+            result = result.replacingOccurrences(of: "--", with: "-")
+        }
+        result = result.trimmingCharacters(in: CharacterSet(charactersIn: "-_.:"))
+        // 首字符必须是字母或数字；整串被清空（例如纯中文名）时退回通用名
+        guard let first = result.first, first.isLetter || first.isNumber else {
+            return "mac-worker"
+        }
+        return String(result.prefix(64))
     }
 
     static func defaultFFmpegPath() -> String {
@@ -97,9 +108,10 @@ struct WorkerConfiguration: Sendable {
         print("""
         MovieClawTranscoder
 
-        菜单栏 App：直接打开 MovieClawTranscoder.app 后在设置中填写 NAS 地址和 Token。
+        菜单栏 App：直接打开 MovieClawTranscoder.app，在设置里填 movieclaw 地址，
+        按提示到网页「设置 → 设备」批准配对即可，不需要手工填任何令牌。
 
-        无界面兼容模式：
+        无界面模式（无人值守部署；令牌请在网页「设置 → 设备」创建）：
           movieclaw-transcoder --headless --nas-url https://nas.example.com --token <token>
                                [--ffmpeg /opt/homebrew/bin/jellyfin-ffmpeg]
                                [--worker-id macmini-m1] [--max-jobs 1]
@@ -108,7 +120,23 @@ struct WorkerConfiguration: Sendable {
         """)
     }
 
-    private static func normalizedNASURL(_ text: String) throws -> URL {
+    static func validatedWorkerID(_ workerID: String) throws -> String {
+        let trimmed = workerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.range(of: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$", options: .regularExpression) != nil else {
+            throw ConfigurationError.message("Worker 名称只能包含字母、数字、下划线、点、冒号和短横线")
+        }
+        return trimmed
+    }
+
+    static func validatedFFmpegPath(_ ffmpegPath: String) throws -> String {
+        let path = ffmpegPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else {
+            throw ConfigurationError.message("Jellyfin-ffmpeg 路径不能为空")
+        }
+        return path
+    }
+
+    static func normalizedNASURL(_ text: String) throws -> URL {
         var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         while value.hasSuffix("/") {
             value.removeLast()
@@ -214,6 +242,8 @@ struct WorkerStatus: Sendable {
     let activeJobs: Int
     let maxJobs: Int
     let currentJobID: String?
+    /// 源文件名，服务端下发；旧版服务端为 nil，此时回退显示 job id。
+    let currentJobName: String?
     let currentProgress: JobProgress?
     let ffmpegVersion: String
     let encoders: [String]
@@ -221,7 +251,14 @@ struct WorkerStatus: Sendable {
     let updatedAt: Date
 }
 
-enum ConfigurationError: Error, CustomStringConvertible {
+/// 配置与运行期的可读错误。
+///
+/// **必须实现 LocalizedError**：界面和日志一律走 `error.localizedDescription`，
+/// 而它对普通 Error 返回的是「The operation couldn't be completed.
+/// (MovieClawTranscoder.ConfigurationError error 0.)」——精心写好的中文提示
+/// 一个字都到不了用户眼前。只实现 CustomStringConvertible 不够，那条路径
+/// 没人走。
+enum ConfigurationError: Error, LocalizedError, CustomStringConvertible {
     case message(String)
 
     var description: String {
@@ -229,6 +266,8 @@ enum ConfigurationError: Error, CustomStringConvertible {
         case let .message(text): return text
         }
     }
+
+    var errorDescription: String? { description }
 }
 
 private struct ArgumentParser {

@@ -6,6 +6,7 @@ import Foundation
 struct MovieClawTranscoderMain {
     @MainActor
     static func main() {
+        AppLogger.installCrashDiagnostics()
         if CommandLine.arguments.contains("--help") {
             WorkerConfiguration.printUsage()
             return
@@ -69,7 +70,12 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
     private var startupCheckTask: Task<Void, Never>?
     private var ffmpegPreparationTask: Task<Void, Never>?
     private var configuration: WorkerConfiguration?
-    private var latestStatus: WorkerStatus?
+    /// 最近一次 Worker 状态。设置窗打开时也要跟着变——它的「状态」行显示的是
+    /// 现在通不通，不是钥匙串里有没有令牌。赋值点有好几处，用 didSet 统一推送，
+    /// 免得新增一处就漏一处。
+    private var latestStatus: WorkerStatus? {
+        didSet { settingsWindow?.update(status: latestStatus) }
+    }
     private var isConfigured = false
     private var ffmpegSource: FFmpegSource = .custom
     private var workerDrainedForFFmpeg = false
@@ -99,10 +105,18 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
                 managedPath: snapshot.managedFFmpegPath,
                 managedVersion: snapshot.managedFFmpegVersion
             )
+            // 「配没配过」只看 UserDefaults 里的标记，不读钥匙串
             isConfigured = !snapshot.nasURL.isEmpty && snapshot.tokenConfigured
-            if isConfigured {
-                configuration = try configurationStore.loadConfiguration()
-            }
+            // 这里**刻意不去读令牌**。
+            //
+            // 读令牌意味着敲钥匙串，而钥匙串可能弹窗要密码（见 KeychainStore
+            // 顶部关于代码签名的说明）。冷启动就甩用户一个系统授权框，他既不
+            // 知道为什么弹，也不知道点了会发生什么——尤其是他可能压根没打算
+            // 让 App 现在连上去。
+            //
+            // 令牌改成用到时才读（ensureConfiguration）：开了自动连接就在
+            // ffmpeg 检查通过、真要连的那一刻读；没开就等他点「连接」。
+            // 两种情况下弹窗都紧跟着一个他自己发起的动作，说得通。
             menuBar.update(status: nil, configured: isConfigured)
             menuBar.update(ffmpeg: ffmpegManager.menuState)
             prepareFFmpeg(snapshot: snapshot)
@@ -120,7 +134,8 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
             let usable = await self.probeFFmpeg(path: snapshot.ffmpegPath)
             guard !Task.isCancelled else { return }
             if usable {
-                if snapshot.autoConnect, self.configuration != nil {
+                // ffmpeg 不可用时根本不会连，也就不必为此读一次钥匙串
+                if snapshot.autoConnect, self.ensureConfiguration() != nil {
                     self.startWorker()
                 }
                 return
@@ -143,7 +158,12 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
 
     private func showStartupDownloadPrompt() {
         guard !ffmpegManager.isProcessing else { return }
-        NSApp.activate(ignoringOtherApps: true)
+        // activate(ignoringOtherApps:) 在 macOS 14 已废弃
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         let alert = NSAlert()
         alert.messageText = "未检测到可用的 Jellyfin-ffmpeg"
         alert.informativeText = "MovieClaw Transcoder 需要带有 h264_videotoolbox 的 Jellyfin-ffmpeg 才能执行硬件转码。是否从 Jellyfin 官方下载 macOS arm64 版本？"
@@ -169,6 +189,7 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
             activeJobs: 0,
             maxJobs: configuration?.maxJobs ?? 1,
             currentJobID: nil,
+            currentJobName: nil,
             currentProgress: nil,
             ffmpegVersion: "-",
             encoders: [],
@@ -303,11 +324,9 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
                         await self.stopWorkerAndWait()
                         self.workerDrainedForFFmpeg = false
                     }
-                    if self.isConfigured {
-                        self.configuration = try self.configurationStore.loadConfiguration()
-                        if snapshot.autoConnect, self.configuration != nil {
-                            self.startWorker()
-                        }
+                    if self.isConfigured, snapshot.autoConnect,
+                       self.ensureConfiguration() != nil {
+                        self.startWorker()
                     }
                 }
                 AppLogger.shared.info(
@@ -323,15 +342,34 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
     private func connectOrOpenSettings() {
         if workerClient != nil {
             stopWorker()
-        } else if configuration != nil {
+        } else if ensureConfiguration() != nil {
             startWorker()
         } else {
             openSettings()
         }
     }
 
+    /// 需要令牌时才把配置装配出来。
+    ///
+    /// 启动时如果没开自动连接就不会去读钥匙串，`configuration` 于是是空的；
+    /// 用户点「连接」时在这里补上。读失败（比如他在系统弹窗上点了拒绝）就把
+    /// 原因说清楚，而不是默默什么也不发生。
+    @discardableResult
+    private func ensureConfiguration() -> WorkerConfiguration? {
+        if let configuration {
+            return configuration
+        }
+        guard isConfigured else { return nil }
+        do {
+            configuration = try configurationStore.loadConfiguration()
+        } catch {
+            showStartupError(error)
+        }
+        return configuration
+    }
+
     private func startWorker() {
-        guard let configuration else {
+        guard let configuration = ensureConfiguration() else {
             openSettings()
             return
         }
@@ -365,6 +403,7 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
             activeJobs: 0,
             maxJobs: configuration.maxJobs,
             currentJobID: nil,
+            currentJobName: nil,
             currentProgress: nil,
             ffmpegVersion: "检查中",
             encoders: [],
@@ -390,6 +429,7 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
             activeJobs: 0,
             maxJobs: configuration?.maxJobs ?? 1,
             currentJobID: nil,
+            currentJobName: nil,
             currentProgress: nil,
             ffmpegVersion: "-",
             encoders: [],
@@ -414,6 +454,7 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
             activeJobs: 0,
             maxJobs: configuration?.maxJobs ?? 1,
             currentJobID: nil,
+            currentJobName: nil,
             currentProgress: nil,
             ffmpegVersion: "-",
             encoders: [],
@@ -447,21 +488,19 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
         do {
             let snapshot = try configurationStore.snapshot()
             let controller = SettingsWindowController(snapshot: snapshot)
+            // 保存与配对是两回事：改地址不该动令牌，配对成功也不该改地址。
+            // 分成两个回调，「改个端口结果掉线了」这种事就不会发生。
             controller.onSave = { [weak self] draft in
                 guard let self else { return }
                 let newConfiguration = try self.configurationStore.save(draft)
-                self.configuration = newConfiguration
-                self.isConfigured = true
-                let snapshot = try self.configurationStore.snapshot()
-                self.ffmpegSource = snapshot.ffmpegSource
-                self.ffmpegManager.configure(
-                    managedPath: snapshot.managedFFmpegPath,
-                    managedVersion: snapshot.managedFFmpegVersion
-                )
-                self.menuBar.update(ffmpeg: self.ffmpegManager.menuState)
-                self.stopWorker()
-                self.startWorker()
-                AppLogger.shared.info("Worker 配置已保存：\(newConfiguration.nasURL.host ?? "未知主机")")
+                self.applyConfiguration(newConfiguration)
+                AppLogger.shared.info("Worker 设置已保存：\(draft.nasURL)")
+            }
+            controller.onPaired = { [weak self] token in
+                guard let self else { return }
+                try self.configurationStore.saveToken(token)
+                self.applyConfiguration(try self.configurationStore.loadConfiguration())
+                AppLogger.shared.info("Worker 已完成配对并获得授权")
             }
             controller.onClear = { [weak self] in
                 guard let self else { return }
@@ -481,9 +520,34 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
                 AppLogger.shared.info("Worker 配置已清除")
             }
             settingsWindow = controller
+            // 窗口是现开的，didSet 推不到它，开窗时补一次当前状态
+            controller.update(status: latestStatus)
             controller.showWindowAndFocus()
         } catch {
             showStartupError(error)
+        }
+    }
+
+    /// 配置变更后的统一收尾：刷新 ffmpeg 状态、菜单栏，并重启 Worker 连接。
+    ///
+    /// 配置为 nil 表示还没配对完（地址填了但没授权）——此时不该去连，
+    /// 也不该把菜单栏显示成已配置。
+    private func applyConfiguration(_ newConfiguration: WorkerConfiguration?) {
+        configuration = newConfiguration
+        isConfigured = newConfiguration != nil
+        if let snapshot = try? configurationStore.snapshot() {
+            ffmpegSource = snapshot.ffmpegSource
+            ffmpegManager.configure(
+                managedPath: snapshot.managedFFmpegPath,
+                managedVersion: snapshot.managedFFmpegVersion
+            )
+        }
+        menuBar.update(ffmpeg: ffmpegManager.menuState)
+        stopWorker()
+        if newConfiguration != nil {
+            startWorker()
+        } else {
+            menuBar.update(status: nil, configured: false)
         }
     }
 
@@ -526,6 +590,7 @@ final class MovieClawAppDelegate: NSObject, NSApplicationDelegate {
             activeJobs: 0,
             maxJobs: configuration?.maxJobs ?? 1,
             currentJobID: nil,
+            currentJobName: nil,
             currentProgress: nil,
             ffmpegVersion: "-",
             encoders: [],

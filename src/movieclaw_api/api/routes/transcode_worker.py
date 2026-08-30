@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect
 
-from movieclaw_api.api.deps import require_admin
+from movieclaw_api.api.deps import require_admin, resolve_worker_principal
 from movieclaw_api.exceptions import (
     InsufficientStorageException,
     NotFoundException,
@@ -35,10 +35,9 @@ from movieclaw_api.services.playback import remote_config as remote_transcode_co
 from movieclaw_api.services.playback.remote_signing import verify_remote_grant
 from movieclaw_api.services.playback.remote_worker import (
     REMOTE_WORKER_PROTOCOL_VERSION,
-    REMOTE_WORKER_TOKEN_HEADER,
     effective_remote_transcode_config,
     get_remote_worker_registry,
-    verify_worker_token,
+    remote_worker_enabled,
 )
 from movieclaw_api.services.playback.session import get_session_manager
 from movieclaw_db.engine import get_session
@@ -152,14 +151,65 @@ async def _verify_grant(
     return grant
 
 
+def _observed_base_url(websocket: WebSocket) -> str:
+    """推断 Worker 刚刚是从哪个根地址连进来的。
+
+    远程转码要下发两个 URL 给 Worker：去哪儿读源视频、把 HLS 产物传回哪儿。
+    这两个地址过去只能由管理员在网页上手填，可它其实是已知的——Worker 的
+    控制连接本身就是从某个地址打过来的，那个地址**必然**是这台 Worker 够得
+    着的，比任何猜测都可靠。
+
+    取值顺序：
+    * scheme 优先信 ``X-Forwarded-Proto``。TLS 在反向代理上终止时，Worker 用
+      的是 wss，转到应用的却是 ws，只看 scope 会拼出一个连不上的 http 地址。
+    * host 用 ``Host`` 头，也就是 Worker 拨号时写的那个主机名/端口。
+    * 末尾接上 ``root_path``，兼容把应用挂在子路径下的反向代理。
+
+    只有代理把 Host 改写成了上游地址（如 ``127.0.0.1:8000``）这种少见配置，
+    推断才会失真——那正是网页上「专用地址」覆盖项存在的意义。
+    """
+    forwarded = (websocket.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    if forwarded in {"http", "https"}:
+        scheme = forwarded
+    elif forwarded in {"ws", "wss"}:
+        scheme = "http" if forwarded == "ws" else "https"
+    else:
+        scheme = "https" if websocket.url.scheme == "wss" else "http"
+    host = (websocket.headers.get("host") or "").strip()
+    if not host:
+        return ""
+    root_path = (websocket.scope.get("root_path") or "").rstrip("/")
+    return f"{scheme}://{host}{root_path}"
+
+
 @router.websocket("/ws")
 async def transcode_worker_websocket(websocket: WebSocket) -> None:
     """接收 Worker hello，并持续处理心跳与任务状态。"""
-    # 控制面令牌只允许放在 Header，避免把长期共享令牌写进反向代理访问日志、
-    # 浏览器历史或监控 URL。数据面 token 是短时会话凭据，才使用查询参数。
-    provided = websocket.headers.get(REMOTE_WORKER_TOKEN_HEADER)
-    if not verify_worker_token(provided):
-        await websocket.close(code=1008, reason="Worker 未启用或令牌无效")
+    # 凭证走标准 Authorization: Bearer，与 CLI 同一个验签入口
+    # （docs/design/device-auth.md §5.4）。放 Header 而不是查询参数，是为了
+    # 不把长期令牌写进反向代理访问日志与监控 URL；数据面用的短时签名 token
+    # 才走查询参数，那是另一套且随会话失效。
+    # 两个拒绝理由必须分开报，且顺序不能反。
+    #
+    # 合成一句「远程转码未启用，或凭证无效、已被吊销」会把两件性质完全不同的
+    # 事混在一起：前者是管理员一个开关没打开、两秒能修；后者是授权出了问题、
+    # 要重新配对。用户刚配对成功就看到「凭证无效」，第一反应是再配一遍，
+    # 而真正该做的是回网页打开开关。
+    #
+    # 先判凭证再判开关：没有有效令牌的人不该从错误文案里读出这台服务器的
+    # 功能开关状态。
+    principal = await resolve_worker_principal(websocket.headers.get("authorization"))
+    if principal is None:
+        await websocket.close(
+            code=1008,
+            reason="凭证无效或已被吊销，请在网页「设置 → 设备」重新配对",
+        )
+        return
+    if not remote_worker_enabled():
+        await websocket.close(
+            code=1008,
+            reason="服务端尚未启用远程转码，请在网页「应用 → 远程转码」打开开关并确认地址",
+        )
         return
 
     await websocket.accept()
@@ -179,7 +229,9 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
             await websocket.close(code=1008, reason="Worker hello 格式错误")
             return
         try:
-            connection = await registry.register(websocket, hello)
+            connection = await registry.register(
+                websocket, hello, observed_base_url=_observed_base_url(websocket)
+            )
         except ValueError as exc:
             await websocket.close(code=1008, reason=str(exc))
             return
@@ -193,8 +245,18 @@ async def transcode_worker_websocket(websocket: WebSocket) -> None:
             message = await websocket.receive_json()
             if isinstance(message, dict):
                 await registry.handle_message(connection, message)
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        # 断开码是区分「Worker 崩了」和「用户自己退出」的唯一线索，必须打出来：
+        # 1000/1001 是对端发了关闭帧的正常退出；1006 代表连关闭帧都没来得及发，
+        # 几乎总意味着 Mac 上的 Worker 进程异常终止（崩溃、被杀、拔网线）。
+        # 看到 1006 就该去那台 Mac 上翻 ~/Library/Logs/MovieClawTranscoder.log
+        # 的 [CRASH] 面包屑，以及 ~/Library/Logs/DiagnosticReports 里的 .ips。
+        logger.warning(
+            "远程 Worker 控制连接断开：worker=%s code=%s%s",
+            connection.worker_id if connection is not None else "未握手",
+            exc.code,
+            "（无关闭帧，Worker 进程多半是异常退出的）" if exc.code == 1006 else "",
+        )
     except Exception:  # noqa: BLE001
         logger.exception("远程 Worker 控制连接异常")
     finally:

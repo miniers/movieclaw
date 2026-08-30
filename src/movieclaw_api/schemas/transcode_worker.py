@@ -13,30 +13,25 @@ from movieclaw_api.settings.remote_transcode import (
 )
 
 RemoteTranscodeBaseUrlSource = Literal[
+    # 网页「高级」里填了覆盖地址
     "remote_transcode_setting",
-    "system_external_url",
-    "unset",
+    # 默认：用接单 Worker 自己连上来的地址，没有静态值可展示
+    "worker_connection",
 ]
 
 
 class RemoteTranscodeConfigPayload(BaseModel):
     """网页保存的远程转码配置。
 
-    ``worker_token`` 使用三态语义：``null`` 表示保持当前令牌，空字符串表示
-    清除令牌，其余字符串表示替换令牌。这样 GET 接口无需回传敏感值，
-    前端也能在不修改令牌时安全地保存其他字段。
+    没有令牌字段：Worker 的凭证在「设置 → 设备」里配对签发与吊销
+    （docs/design/device-auth.md §5.4）。
     """
 
     enabled: bool = Field(default=False, description="是否启用远程硬件转码")
     base_url: str | None = Field(
         default=None,
         max_length=4096,
-        description="远程转码专用根地址；null=保持，空字符串=清除并回退系统外部访问地址",
-    )
-    worker_token: str | None = Field(
-        default=None,
-        max_length=4096,
-        description="Worker 令牌；null=保持，空字符串=清除",
+        description="取源/回传根地址的覆盖项；null=保持，空字符串=清除并回到自动推断",
     )
     max_artifact_bytes: int = Field(
         default=DEFAULT_REMOTE_TRANSCODE_MAX_ARTIFACT_BYTES,
@@ -47,20 +42,21 @@ class RemoteTranscodeConfigPayload(BaseModel):
 
 
 class RemoteTranscodeConfigView(BaseModel):
-    """网页展示的远程转码配置，不包含令牌明文。"""
+    """网页展示的远程转码配置。"""
 
     enabled: bool
-    worker_token_configured: bool
-    base_url: str = Field(default="", description="实际使用的远程转码根地址")
+    base_url: str = Field(
+        default="", description="静态配置出的根地址；空表示自动使用 Worker 连上来的地址"
+    )
     base_url_override: str = Field(
-        default="", description="网页配置的远程转码专用根地址；空表示跟随系统外部访问地址"
+        default="", description="网页配置的覆盖地址；空表示不覆盖"
     )
     base_url_source: RemoteTranscodeBaseUrlSource
     max_artifact_bytes: int
-    ready: bool = Field(description="配置是否满足启用远程转码的前置条件")
+    ready: bool = Field(description="开关已开，且填过的覆盖地址（如果填了）合法")
     issues: list[str] = Field(
         default_factory=list,
-        description="当前配置缺少的前置条件；不包含任何令牌内容",
+        description="覆盖地址的格式问题；地址留空不算问题，不包含任何令牌内容",
     )
 
 

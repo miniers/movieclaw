@@ -14,6 +14,8 @@ actor WorkerClient {
     private var jobs: [String: JobExecution] = [:]
     private var uploadProxies: [String: ArtifactUploadProxy] = [:]
     private var jobAttempts: [String: String] = [:]
+    /// 任务的展示名（服务端下发的源文件名），只用于菜单栏显示。
+    private var jobNames: [String: String] = [:]
     private var lastProgressSent: [String: Date] = [:]
     private var currentProgress: [String: JobProgress] = [:]
     private var state: WorkerConnectionState = .stopped
@@ -115,7 +117,10 @@ actor WorkerClient {
             throw ConfigurationError.message("NAS 地址协议无效，仅支持 HTTP 或 HTTPS")
         }
         var request = URLRequest(url: endpoint)
-        request.setValue(configuration.workerToken, forHTTPHeaderField: "X-MovieClaw-Worker-Token")
+        // 标准 Authorization: Bearer，与 CLI 走同一个验签入口
+        // （docs/design/device-auth.md §5.4）。放 Header 而不是查询参数，
+        // 避免长期令牌进反向代理访问日志与监控 URL。
+        request.setValue("Bearer \(configuration.workerToken)", forHTTPHeaderField: "Authorization")
         let session = URLSession(configuration: .ephemeral)
         let socket = session.webSocketTask(with: request)
         self.socket = socket
@@ -150,7 +155,15 @@ actor WorkerClient {
         defer { heartbeat.cancel() }
 
         while !Task.isCancelled && !stopRequested {
-            let message = try await socket.receive()
+            let message: URLSessionWebSocketTask.Message
+            do {
+                message = try await socket.receive()
+            } catch {
+                // 服务端主动拒绝时（1008）带着可读的理由，比如「凭证已吊销」
+                // 或「远程转码开关没打开」。URLSession 抛出来的是一句
+                // 「Socket is not connected」，把用户真正需要的那句话丢了。
+                throw Self.closeReasonError(from: socket) ?? error
+            }
             // 任何一条消息都算链路活着，心跳 ack 也不例外
             lastServerMessageAt = Date()
             guard case let .string(text) = message,
@@ -161,6 +174,20 @@ actor WorkerClient {
             }
             await handle(object)
         }
+    }
+
+    /// 把服务端的 WebSocket 关闭理由取出来变成可读错误。
+    ///
+    /// 只认策略性关闭（1008 policyViolation）——那是服务端「我不接受你」的
+    /// 明确表态，理由由服务端写好；网络断开之类的关闭码没有这种文本，
+    /// 交回原错误即可。
+    private static func closeReasonError(from socket: URLSessionWebSocketTask) -> Error? {
+        guard socket.closeCode == .policyViolation,
+              let data = socket.closeReason,
+              let reason = String(data: data, encoding: .utf8),
+              !reason.isEmpty
+        else { return nil }
+        return ConfigurationError.message(reason)
     }
 
     private func heartbeatLoop() async {
@@ -233,6 +260,10 @@ actor WorkerClient {
             return
         }
         let attemptID = message["attempt_id"] as? String ?? jobID
+        // 旧版服务端不带这个字段，缺了就退回显示 job id
+        if let name = message["display_name"] as? String, !name.isEmpty {
+            jobNames[jobID] = name
+        }
         if draining {
             await sendFailure(jobID: jobID, attemptID: attemptID, error: "Worker 正在排空，不接受新任务")
             return
@@ -344,6 +375,7 @@ actor WorkerClient {
         let succeeded = result.succeeded && uploadFailure == nil
         let failure = uploadFailure ?? result.error
         let attemptID = jobAttempts.removeValue(forKey: jobID) ?? jobID
+        jobNames.removeValue(forKey: jobID)
         jobs.removeValue(forKey: jobID)
         uploadProxies.removeValue(forKey: jobID)?.stop()
         currentProgress.removeValue(forKey: jobID)
@@ -404,6 +436,7 @@ actor WorkerClient {
         jobs.removeAll()
         uploadProxies.removeAll()
         jobAttempts.removeAll()
+        jobNames.removeAll()
         currentProgress.removeAll()
         lastProgressSent.removeAll()
     }
@@ -432,6 +465,7 @@ actor WorkerClient {
                 activeJobs: jobs.count,
                 maxJobs: configuration.maxJobs,
                 currentJobID: currentJobID,
+                currentJobName: currentJobID.flatMap { jobNames[$0] },
                 currentProgress: currentJobID.flatMap { currentProgress[$0] },
                 ffmpegVersion: capabilities.ffmpegVersion,
                 encoders: capabilities.encoders,

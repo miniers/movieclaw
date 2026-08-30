@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import logging
 import re
 import threading
@@ -35,7 +34,6 @@ from movieclaw_api.services.playback.remote_config import (
 
 logger = logging.getLogger("movieclaw_api.playback.remote_worker")
 
-REMOTE_WORKER_TOKEN_HEADER = "x-movieclaw-worker-token"
 REMOTE_WORKER_PROTOCOL_VERSION = 1
 WORKER_IDLE_TIMEOUT_S = 45.0
 JOB_ACCEPT_TIMEOUT_S = 8.0
@@ -65,6 +63,10 @@ class WorkerConnection:
     worker_id: str
     websocket: WebSocket
     capabilities: WorkerCapabilities
+    # Worker 实际连上来的根地址（scheme://host[:port][根路径]），由控制面
+    # 握手时从请求本身推断，Worker 不需要上报、用户也不需要填。它天然是
+    # 「这台 Worker 一定够得着」的地址——它刚刚就是从那儿连进来的。
+    observed_base_url: str = ""
     worker_version: str | None = None
     arch: str | None = None
     connected_at: float = field(default_factory=time.monotonic)
@@ -96,7 +98,11 @@ class RemoteWorkerRegistry:
     # -- Worker 生命周期 -------------------------------------------------
 
     async def register(
-        self, websocket: WebSocket, hello: dict[str, Any]
+        self,
+        websocket: WebSocket,
+        hello: dict[str, Any],
+        *,
+        observed_base_url: str = "",
     ) -> WorkerConnection:
         """校验 hello 并登记 Worker；同 ID 的旧连接会被替换。"""
         raw_worker_id = hello.get("worker_id")
@@ -110,6 +116,7 @@ class RemoteWorkerRegistry:
             worker_id=worker_id,
             websocket=websocket,
             capabilities=capabilities,
+            observed_base_url=observed_base_url,
             worker_version=str(hello.get("worker_version"))
             if hello.get("worker_version")
             else None,
@@ -145,10 +152,12 @@ class RemoteWorkerRegistry:
                 return
             self._workers.pop(connection.worker_id, None)
             lost_jobs = self._mark_jobs_lost(connection, "远程 Worker 已断开连接")
+        # 带上被判失败的任务 ID：Worker 崩在半路时，用户先看到的是「播放失败」，
+        # 而这一行是把那次失败和这台 Worker 的掉线对上号的唯一凭据。
         logger.warning(
-            "远程转码 Worker 已离线：%s，影响任务=%d",
+            "远程转码 Worker 已离线：%s，%s",
             connection.worker_id,
-            len(lost_jobs),
+            f"进行中的任务已判失败={','.join(lost_jobs)}" if lost_jobs else "无进行中的任务",
         )
 
     async def shutdown(self) -> None:
@@ -260,14 +269,21 @@ class RemoteWorkerRegistry:
         except TimeoutError as exc:
             raise RemoteWorkerUnavailable("远程 Worker 接单超时") from exc
 
-    async def dispatch(
+    def reserve(
         self,
         job_id: str,
-        payload: dict[str, Any],
         *,
         backend: str,
-    ) -> str:
-        """选一个空闲 Worker 下发任务，并返回 Worker ID。"""
+        attempt_id: str | None = None,
+    ) -> WorkerConnection:
+        """选一个空闲 Worker 并占住槽位，返回它的连接。
+
+        为什么先占位再下发、而不是一个 ``dispatch`` 打包做完：任务里的源地址
+        和产物上传地址要用**这台** Worker 连上来的地址拼（``observed_base_url``），
+        所以必须先确定是谁接单。占位和选人在同一把锁里完成，不会出现「按 A 的
+        地址拼 URL，任务却发给了 B」。占位后如果拼装或发送失败，调用方必须调
+        ``release_job``（``start_job`` 失败时会自己调）。
+        """
         with self._lock:
             if job_id in self._job_workers:
                 raise RemoteWorkerUnavailable("远程任务已存在")
@@ -275,11 +291,23 @@ class RemoteWorkerRegistry:
             if connection is None:
                 raise RemoteWorkerUnavailable("没有在线且空闲的 Apple VideoToolbox Worker")
             self._job_workers[job_id] = connection.worker_id
-            attempt_id = payload.get("attempt_id")
             self._job_attempts[job_id] = (
                 attempt_id if isinstance(attempt_id, str) and attempt_id else job_id
             )
             connection.jobs.add(job_id)
+        return connection
+
+    def release_job(self, job_id: str) -> None:
+        """占位之后拼装失败时归还槽位。"""
+        self._release_job(job_id)
+
+    async def start_job(
+        self,
+        connection: WorkerConnection,
+        job_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        """向已占位的 Worker 下发任务；发送失败自动归还槽位。"""
         try:
             await connection.send({"type": "job.start", "job_id": job_id, **payload})
         except Exception as exc:  # noqa: BLE001
@@ -495,7 +523,10 @@ def reset_remote_worker_registry() -> None:
 
 
 def remote_worker_enabled() -> bool:
-    """远程硬件能力只有在配置完整且功能开关打开时才对决策层可见。"""
+    """开关打开、且（若填了）覆盖地址合法时，远程硬件才对决策层可见。
+
+    地址本身不是前置条件：默认取自 Worker 连上来的地址（observed_base_url）。
+    """
     config = effective_remote_transcode_config()
     return config.enabled and not remote_transcode_issues(config)
 
@@ -503,14 +534,6 @@ def remote_worker_enabled() -> bool:
 def effective_remote_transcode_config() -> RemoteTranscodeRuntimeConfig:
     """供同步调用方读取网页配置的运行时快照。"""
     return _effective_remote_transcode_config()
-
-
-def verify_worker_token(provided: str | None) -> bool:
-    """校验控制面共享令牌；使用常量时间比较，避免令牌时序泄漏。"""
-    configured = effective_remote_transcode_config().worker_token
-    if not remote_worker_enabled() or not provided or not configured:
-        return False
-    return hmac.compare_digest(provided, configured)
 
 
 def remote_worker_available(backend: str = "videotoolbox") -> bool:
