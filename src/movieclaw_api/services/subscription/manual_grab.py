@@ -84,6 +84,7 @@ async def grab_manual(
     from movieclaw_api.services.subscription.dispatch import dispatch
     from movieclaw_api.services.subscription.matching import (
         covered_units,
+        load_season_titles,
         publish_calendar_date,
     )
 
@@ -183,6 +184,7 @@ async def grab_manual(
         imdb_id=item.imdb_id,
         douban_id=item.douban_id,
         season_numbers=tuple(sorted({s for s, _ in open_wanted} | {s for s, _ in upgrade_pool})),
+        season_titles=await load_season_titles(session, subscription.media_item_id),
     )
     match = match_identity(candidate, identity)
     if match is None:

@@ -20,6 +20,7 @@ from sqlmodel import select
 
 from movieclaw_api.services.subscription.matching import (
     covered_units,
+    load_season_titles,
     publish_calendar_date,
     to_candidate,
     units_text,
@@ -450,6 +451,7 @@ async def _try_candidates(
         imdb_id=item.imdb_id,
         douban_id=item.douban_id,
         season_numbers=tuple(sorted({season for season, _episode in open_units})),
+        season_titles=await load_season_titles(session, subscription.media_item_id),
     )
     excluded = await _excluded_candidates(session, attempt.subscription_id)
     accepted = []

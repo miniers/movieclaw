@@ -255,6 +255,14 @@ NER 上线后升级为"正向抽取 + 反向验证"双向校验，并把 `parsed
 `tmdb_id` + 置信度）经 enrich 管线写回 `site_torrent`（`enrich_version` 机制已支持全量重算），
 让被动匹配退化为带索引的 DB 查询。
 
+> **双向校验已落地（2026-08）**：`attrs.titles_zh/titles_en`（NER 抽取片名）
+> 作为额外片名段参与别名覆盖率验证，见 `movieclaw_matcher/identity.py`。
+> 动因是真实漏配：国综把季副标题并进英文片名（"The Chinese Restaurant
+> Southeast Asian Flavors 2026 S10E01"），启发式切段的覆盖率被副标题稀释到
+> 阈值之下，只有 NER 抽出的干净片名能命中。`title_candidates`（噪音保险层）
+> 与短别名分支明确排除在外，误报面不扩大。"写回 tmdb_id + 带索引 DB 查询"
+> 部分仍未做。
+
 ### 3.2 第二级：规则过滤 —— RuleSet 谓词
 
 RuleSet 独立成实体（订阅引用），维度：分辨率、编码、HDR、DV、制作组黑白名单、

@@ -24,6 +24,7 @@ from sqlmodel import select
 from movieclaw_db.models import (
     ActivityType,
     MediaItem,
+    MediaSeason,
     RuleSet,
     SiteCredential,
     SiteTorrent,
@@ -179,6 +180,26 @@ async def _load_specs(session: AsyncSession) -> dict[int, RuleSetSpec | None]:
     return specs
 
 
+async def load_season_titles(session: AsyncSession, media_item_id: int) -> tuple[str, ...]:
+    """条目的季名清单（media_season.name，空串剔除）。
+
+    参与身份匹配的"别名+季名"组合等式（见 movieclaw_matcher/identity.py）：
+    国综把季副标题并进片名，只靠主标题别名会漏配。所有构造 MediaIdentity
+    的路径（缺口匹配/人工选种/换源救援/发布预测）都应带上它，判定口径才一致。
+    """
+    return tuple(
+        name
+        for name in (
+            await session.execute(
+                select(MediaSeason.name).where(MediaSeason.media_item_id == media_item_id)
+            )
+        )
+        .scalars()
+        .all()
+        if name
+    )
+
+
 async def _ensure_context(
     session: AsyncSession,
     contexts: dict[int, MediaContext],
@@ -193,6 +214,7 @@ async def _ensure_context(
     item = await session.get(MediaItem, media_item_id)
     if item is None:  # 外键保证下理论不可达
         return None
+    season_titles = await load_season_titles(session, media_item_id)
     ctx = MediaContext(
         item=item,
         identity=MediaIdentity(
@@ -202,6 +224,7 @@ async def _ensure_context(
             imdb_id=item.imdb_id,
             douban_id=item.douban_id,
             season_numbers=(),  # 先占位，收集完工单后统一回填
+            season_titles=season_titles,
         ),
         subscription=subscription,
         spec=spec,
@@ -405,6 +428,7 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
             imdb_id=ctx.identity.imdb_id,
             douban_id=ctx.identity.douban_id,
             season_numbers=seasons,
+            season_titles=ctx.identity.season_titles,
         )
     return contexts
 

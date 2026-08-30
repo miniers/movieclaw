@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.services.subscription.matching import (
+    load_season_titles,
     publish_calendar_date,
     to_candidate,
 )
@@ -190,6 +191,7 @@ def _observations_for_item(
     item: MediaItem,
     episodes: list[MediaEpisode],
     candidates: list[tuple[SiteTorrent, TorrentCandidate]],
+    season_titles: tuple[str, ...] = (),
 ) -> list[_ObservedRelease]:
     """从 site_torrent 提取本条目的明确单集观测；整季包与多集包不参与训练。"""
     season_numbers = tuple(sorted({episode.season_number for episode in episodes}))
@@ -200,6 +202,7 @@ def _observations_for_item(
         imdb_id=item.imdb_id,
         douban_id=item.douban_id,
         season_numbers=season_numbers,
+        season_titles=season_titles,
     )
     air_dates = {
         (episode.season_number, episode.episode_number): episode.air_date
@@ -437,6 +440,7 @@ async def refresh_release_forecasts(
             item=item,
             episodes=episodes,
             candidates=candidates,
+            season_titles=await load_season_titles(session, media_item_id),
         )
         for wanted in wanted_items:
             forecast = _build_forecast(wanted=wanted, observations=observations, now=now)

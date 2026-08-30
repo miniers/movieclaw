@@ -159,6 +159,142 @@ def test_real_sample_variety_show_single_episode() -> None:
     assert match.is_pack is False
 
 
+def test_real_sample_season_subtitle_embedded_in_title() -> None:
+    """真实漏配回归（2026-08，中餐厅 S10E01，attrs 逐字取自生产库）：国综把
+    季副标题并进片名，启发式片名段被撑长（"thechineserestaurant…flavors"
+    41 字符，别名覆盖率 48.8%），且 NER 的正确抽取同样是季全名——覆盖率路线
+    对该命名结构性无解，必须靠"别名+季名"组合等式命中。"""
+    candidate = _candidate(
+        "The Chinese Restaurant Southeast Asian Flavors 2026 S10E01 "
+        "2160p WEB-DL H.265 AAC 2.0-QHstudIo",
+        "中餐厅·南洋拾光季 第01期 *含EP00+加更版+独家直拍"
+        "【无芒果TV水印 | 4K高码率】【嘉宾：黄晓明 | 王俊凯】QHstudIo小组作品",
+        media_type="tv",
+        content_type="variety",
+        titles_zh=["中餐厅·南洋拾光季"],
+        titles_en=["The Chinese Restaurant Southeast Asian Flavors"],
+        title_candidates=["王俊凯"],
+        year=2026,
+        seasons=[10],
+        episodes=[1],
+        resolution="2160p",
+    )
+    media = _tv(
+        ["中餐厅", "Zhong Can Ting", "The Chinese Restaurant", "Chinese Restaurant", "中餐廳"],
+        2017,
+        seasons=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+        season_titles=("特别篇", "第 1 季", "2023", "2024", "非洲创业季", "南洋拾光季"),
+    )
+    match = match_identity(candidate, media)
+
+    assert match is not None
+    assert match.episodes == frozenset({(10, 1)})
+    assert match.matched_alias == "中餐厅"
+
+
+def test_season_title_composite_requires_exact_equality() -> None:
+    """组合等式必须整段精确相等：段里带前缀噪音（NexusPHP 副标题的
+    "国语 中字" 前缀）或季名对不上时不得命中——它是强信号，不能退化成子串。"""
+    noisy = _candidate(
+        "The Chinese Restaurant Southeast Asian Flavors 2026 S10E01 2160p WEB-DL",
+        "国语 中字 中餐厅·南洋拾光季",
+        media_type="tv",
+        year=2026,
+        seasons=[10],
+        episodes=[1],
+    )
+    other_season = _candidate(
+        "Some Show Nanyang 2026 S01E01 1080p WEB-DL",
+        "别的剧·南洋篇",
+        media_type="tv",
+        year=2026,
+        seasons=[1],
+        episodes=[1],
+    )
+    media = _tv(
+        ["中餐厅"],
+        2017,
+        seasons=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+        season_titles=("南洋拾光季",),
+    )
+    assert match_identity(noisy, media) is None
+    assert match_identity(other_season, media) is None
+
+
+def test_ner_titles_do_not_relax_coverage_guard() -> None:
+    """NER 段走同一套覆盖率验证：泛化别名对 NER 抽出的更长片名依旧覆盖不足，
+    Mr Kim 类误配不因新增段来源而复活。"""
+    candidate = _candidate(
+        "The Dream Life of Mr Kim S01 2025 1080p NF WEB-DL AAC H264-HDSWEB",
+        "金部长的梦想人生",
+        media_type="tv",
+        titles_zh=["金部长的梦想人生"],
+        titles_en=["The Dream Life of Mr Kim"],
+        year=2025,
+        seasons=[1],
+        complete=True,
+    )
+    media = _tv(
+        ["金特务：本色回归", "김부장", "金部长", "Director Kim", "Mr. Kim", "Mr Kim"],
+        2026,
+        seasons=(1,),
+    )
+    assert match_identity(candidate, media) is None
+
+
+def test_spinoff_full_title_in_ner_not_claimed_by_parent_alias() -> None:
+    """衍生剧守卫：母剧别名只是衍生剧 NER 片名的前缀（"ncis" 占
+    "ncislosangeles" 29%），不得认领衍生剧的种子。"""
+    candidate = _candidate(
+        "NCIS Los Angeles S05E01 1080p WEB-DL",
+        "海军罪案调查处：洛杉矶",
+        media_type="tv",
+        titles_zh=["海军罪案调查处：洛杉矶"],
+        titles_en=["NCIS Los Angeles"],
+        year=2013,
+        seasons=[5],
+        episodes=[1],
+    )
+    media = _tv(["NCIS"], 2003, seasons=tuple(range(1, 20)))
+    assert match_identity(candidate, media) is None
+
+
+def test_title_candidates_are_not_identity_segments() -> None:
+    """title_candidates 是噪音保险层（真实样本混有嘉宾人名），不得作为片名段：
+    别名能高覆盖某个 candidate 也不算命中。"""
+    candidate = _candidate(
+        "The Chinese Restaurant Southeast Asian Flavors 2026 S10E01 2160p WEB-DL",
+        "",
+        media_type="tv",
+        title_candidates=["南洋拾光季"],
+        year=2026,
+        seasons=[10],
+        episodes=[1],
+    )
+    # 假想一部叫《南洋拾光》的剧：覆盖 "南洋拾光季" 的 80%，若 candidates
+    # 参与比对就会误配
+    media = _tv(["南洋拾光", "Nanyang Memories"], 2025, seasons=(1,))
+    assert match_identity(candidate, media) is None
+
+
+def test_ner_fragment_cannot_feed_short_alias() -> None:
+    """短别名分支不吃 NER 段：模型偶见碎片产出（"中餐厅"被抽成"餐厅"），
+    一部叫《餐厅》的剧不得借碎片认领《中餐厅》的种子（整词守卫 + 年份精确
+    相等两道原有防线都必须仍然生效）。"""
+    candidate = _candidate(
+        "The Chinese Restaurant S10E11 Journal 2026 2160p WEB-DL H265 AAC-ADWeb",
+        "国语 中字 中餐厅 第十季 合伙人手记",
+        media_type="tv",
+        titles_zh=["餐厅"],
+        titles_en=["The Chinese Restaurant"],
+        year=2026,
+        seasons=[10],
+        episodes=[11],
+    )
+    media = _tv(["餐厅", "The Diner"], 2026, seasons=(1,))
+    assert match_identity(candidate, media) is None
+
+
 # ---------------------------------------------------------------------------
 # 命中：信号与推断
 # ---------------------------------------------------------------------------
