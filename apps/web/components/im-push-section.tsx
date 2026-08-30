@@ -3,7 +3,7 @@
 /**
  * 「消息推送」设置分区。
  *
- * 两类设定按胶囊标签分开（与「应用」「外观」分区同一交互语言），因为它们
+ * 两类设定按胶囊标签分开（与「更新与维护」「外观」分区同一交互语言），因为它们
  * 回答的是两个完全不同的问题，动线不该缠在一起：
  *   - 接入通道：我接了哪些账号？——一张跨平台的统一列表 +「新增通道」菜单，
  *     绑定流程收进弹窗（见 channel-bind-dialog）；
@@ -41,10 +41,12 @@ import {
 } from "@/lib/api/channels";
 import { useBackdrop } from "@/lib/backdrop";
 import { formatRelativeTime } from "@/lib/time";
+import { useTabParam } from "@/lib/use-tab-param";
 import { LiquidGlassButton } from "@/vendor/liquid-glass";
 
 export function ImPushSection() {
-  const [tab, setTab] = useState<"channels" | "content">("channels");
+  // ?tab=content 深链直达推送内容，切换写回地址栏（useTabParam，全设置页同一套）
+  const [tab, setTab] = useTabParam(["channels", "content"] as const, "channels");
   const tabs = [
     { id: "channels" as const, label: "接入通道" },
     { id: "content" as const, label: "推送内容" },
