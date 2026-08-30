@@ -182,7 +182,7 @@ class Settings(BaseSettings):
         default="./data/config/web-port", alias="MOVIECLAW_WEB_PORT_FILE"
     )
     # 更新来源仓库与 API 地址。API 地址可整体换成自建反代。
-    update_repo: str = Field(default="yipengfei329/movieclaw", alias="UPDATE_REPO")
+    update_repo: str = Field(default="movieclaw/movieclaw", alias="UPDATE_REPO")
     update_api_base_url: str = Field(
         default="https://api.github.com", alias="UPDATE_API_BASE_URL"
     )

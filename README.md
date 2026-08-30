@@ -19,15 +19,15 @@
   <a href="#能做什么">功能</a> ·
   <a href="#boundaries">边界</a> ·
   <a href="docs/design/">设计文档</a> ·
-  <a href="https://github.com/yipengfei329/movieclaw/issues">反馈</a>
+  <a href="https://github.com/movieclaw/movieclaw/issues">反馈</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/yipengfei329/movieclaw/releases"><img alt="Release" src="https://img.shields.io/github/v/release/yipengfei329/movieclaw?label=release"></a>
+  <a href="https://github.com/movieclaw/movieclaw/releases"><img alt="Release" src="https://img.shields.io/github/v/release/movieclaw/movieclaw?label=release"></a>
   <a href="https://hub.docker.com/r/movieclaw/movieclaw"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/movieclaw/movieclaw"></a>
   <a href="https://hub.docker.com/r/movieclaw/movieclaw/tags"><img alt="Image Version" src="https://img.shields.io/docker/v/movieclaw/movieclaw/latest?label=docker%20image"></a>
-  <img alt="Last Commit" src="https://img.shields.io/github/last-commit/yipengfei329/movieclaw">
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/yipengfei329/movieclaw"></a>
+  <img alt="Last Commit" src="https://img.shields.io/github/last-commit/movieclaw/movieclaw">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/movieclaw/movieclaw"></a>
 </p>
 
 <p align="center">
@@ -346,7 +346,7 @@ PT 站点保持直连（通常直连更快）。
 （官方镜像已内置，自建才需要）。
 
 ```bash
-git clone https://github.com/yipengfei329/movieclaw.git
+git clone https://github.com/movieclaw/movieclaw.git
 cd movieclaw
 TMDB_API_KEY=你的key ./scripts/build-image.sh
 #   国内网络加速：      CN_MIRROR=1 TMDB_API_KEY=... ./scripts/build-image.sh
@@ -410,7 +410,7 @@ Web 控制台 `http://127.0.0.1:3000`，API 文档 `http://127.0.0.1:8000/docs`�
 > `[Errno 98] Address already in use`，没有 `dev.sh` 那层中文提示。
 
 源码方式运行时，**种子名结构化抽取依赖的 NER 模型需手动放置**（Docker 镜像已内置）：
-从 [Releases](https://github.com/yipengfei329/movieclaw/releases) 下载 `model.int8.onnx`、
+从 [Releases](https://github.com/movieclaw/movieclaw/releases) 下载 `model.int8.onnx`、
 `tokenizer.json`、`labels.json` 放进 `data/models/torrent-ner/`（可用 `MOVIECLAW_NER_DIR` 改路径）后重启。
 不放模型服务照常启动，仅该功能不可用：首次真正触发种子名抽取时，日志会打印
 "未找到种子名抽取模型（…），片名/年份/季集字段将保持空值"。
@@ -423,7 +423,7 @@ Web 控制台 `http://127.0.0.1:3000`，API 文档 `http://127.0.0.1:8000/docs`�
 本 README 自身的结构依据见 [readme-rewrite.md](docs/design/readme-rewrite.md)。
 
 有问题、有建议、发现 Bug，都欢迎开
-[Issue](https://github.com/yipengfei329/movieclaw/issues)。
+[Issue](https://github.com/movieclaw/movieclaw/issues)。
 
 ## License
 

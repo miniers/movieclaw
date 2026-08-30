@@ -116,7 +116,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
 # ---------------------------------------------------------------------------
 # 模型文件与架构无关，同样跑在构建机原生架构上
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS ner-model
-ARG NER_MODEL_BASE=https://github.com/yipengfei329/movieclaw/releases/download/torrent-ner-v3
+ARG NER_MODEL_BASE=https://github.com/movieclaw/movieclaw/releases/download/torrent-ner-v3
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
