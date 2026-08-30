@@ -7,12 +7,12 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/api"
 	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 	"github.com/movieclaw/movieclaw/cli/internal/flagx"
 	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
 	"github.com/movieclaw/movieclaw/cli/internal/output"
+	"github.com/spf13/cobra"
 )
 
 // followTailLines 是 -f 每轮拉取的行数上限。取得比屏幕宽裕得多，让轮询间隔

@@ -5,11 +5,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/api"
 	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
 	"github.com/movieclaw/movieclaw/cli/internal/output"
+	"github.com/spf13/cobra"
 )
 
 // NewDownloadCommand 构造 `mclaw download`：把一条种子提交到默认下载器。

@@ -4,12 +4,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 	"github.com/movieclaw/movieclaw/cli/internal/flagx"
 	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
 	"github.com/movieclaw/movieclaw/cli/internal/output"
 	"github.com/movieclaw/movieclaw/cli/internal/wait"
+	"github.com/spf13/cobra"
 )
 
 // NewLibraryGroup 构造 `mclaw library` 组；生成层随后并入其余媒体库命令。

@@ -3,10 +3,10 @@ package overlay
 import (
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/flagx"
 	"github.com/movieclaw/movieclaw/cli/internal/output"
 	"github.com/movieclaw/movieclaw/cli/internal/wait"
+	"github.com/spf13/cobra"
 )
 
 // NewJobsGroup 构造 `mclaw jobs` 组；生成层随后并入 list / show / cancel 等命令。

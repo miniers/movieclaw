@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/overlay"
+	"github.com/spf13/cobra"
 )
 
 // fullTreeSnapshot 是「精选层 + 生成层」装配完成后的整棵命令树（含分组名），

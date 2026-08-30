@@ -7,9 +7,9 @@ package overlay
 import (
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/api"
 	"github.com/movieclaw/movieclaw/cli/internal/config"
+	"github.com/spf13/cobra"
 )
 
 // Settings 是一次调用的全局标志集合，经 cobra 的 context 传给所有命令。

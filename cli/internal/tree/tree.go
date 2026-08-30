@@ -4,8 +4,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/spec"
+	"github.com/spf13/cobra"
 )
 
 // Build 把生成命令挂到根命令。已存在的同名命令（精选层）优先，不覆盖。

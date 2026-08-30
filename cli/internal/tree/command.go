@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/api"
 	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 	"github.com/movieclaw/movieclaw/cli/internal/flagx"
@@ -17,6 +16,7 @@ import (
 	"github.com/movieclaw/movieclaw/cli/internal/output"
 	"github.com/movieclaw/movieclaw/cli/internal/overlay"
 	"github.com/movieclaw/movieclaw/cli/internal/wait"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 

@@ -13,7 +13,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/movieclaw/movieclaw/cli/internal/api"
 	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 	"github.com/movieclaw/movieclaw/cli/internal/flagx"
@@ -22,6 +21,7 @@ import (
 	"github.com/movieclaw/movieclaw/cli/internal/overlay"
 	"github.com/movieclaw/movieclaw/cli/internal/spec"
 	"github.com/movieclaw/movieclaw/cli/internal/tree"
+	"github.com/spf13/cobra"
 )
 
 const rootLong = `movieclaw 命令行工具：发现电影/剧集、搜索和下载 PT 资源、订阅追更、管理本地媒体库；覆盖页面的主要业务流程和管理设置。
