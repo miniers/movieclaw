@@ -3,10 +3,10 @@ package overlay
 import (
 	"net/url"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/api"
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
-	"github.com/yipengfei329/movieclaw/cli/internal/sse"
+	"github.com/movieclaw/movieclaw/cli/internal/api"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/sse"
 )
 
 // streamEvents 订阅一个 SSE 端点，逐帧调用 handle。

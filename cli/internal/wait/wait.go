@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/api"
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
-	"github.com/yipengfei329/movieclaw/cli/internal/output"
+	"github.com/movieclaw/movieclaw/cli/internal/api"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/output"
 )
 
 // jobTerminalStatuses 是统一 Job 体系的终态集合。

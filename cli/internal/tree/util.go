@@ -3,7 +3,7 @@ package tree
 import (
 	"strings"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
 )
 
 // 生成层高频读 spec 里的动态字段，这里给 jsonval 起短名，读起来不至于全是包前缀。

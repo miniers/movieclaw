@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
 )
 
 func capture(t *testing.T, data any, format string) string {

@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yipengfei329/movieclaw/cli/internal/api"
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
-	"github.com/yipengfei329/movieclaw/cli/internal/output"
-	"github.com/yipengfei329/movieclaw/cli/internal/sse"
+	"github.com/movieclaw/movieclaw/cli/internal/api"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/output"
+	"github.com/movieclaw/movieclaw/cli/internal/sse"
 )
 
 // terminalEvents 是一次模型处理的终态事件；读到即停止跟随。

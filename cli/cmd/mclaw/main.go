@@ -14,14 +14,14 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yipengfei329/movieclaw/cli/internal/api"
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/flagx"
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
-	"github.com/yipengfei329/movieclaw/cli/internal/output"
-	"github.com/yipengfei329/movieclaw/cli/internal/overlay"
-	"github.com/yipengfei329/movieclaw/cli/internal/spec"
-	"github.com/yipengfei329/movieclaw/cli/internal/tree"
+	"github.com/movieclaw/movieclaw/cli/internal/api"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/flagx"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/output"
+	"github.com/movieclaw/movieclaw/cli/internal/overlay"
+	"github.com/movieclaw/movieclaw/cli/internal/spec"
+	"github.com/movieclaw/movieclaw/cli/internal/tree"
 )
 
 const rootLong = `movieclaw 命令行工具：发现电影/剧集、搜索和下载 PT 资源、订阅追更、管理本地媒体库；覆盖页面的主要业务流程和管理设置。

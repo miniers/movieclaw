@@ -29,7 +29,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 )
 
 // 环境变量名。环境变量是 Agent/CI 的主通道，可完全不落盘。

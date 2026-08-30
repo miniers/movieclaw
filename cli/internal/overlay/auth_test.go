@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/discover"
-	"github.com/yipengfei329/movieclaw/cli/internal/output"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/discover"
+	"github.com/movieclaw/movieclaw/cli/internal/output"
 )
 
 func quiet(t *testing.T) {

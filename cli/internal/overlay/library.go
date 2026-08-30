@@ -5,11 +5,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/flagx"
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
-	"github.com/yipengfei329/movieclaw/cli/internal/output"
-	"github.com/yipengfei329/movieclaw/cli/internal/wait"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/flagx"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/output"
+	"github.com/movieclaw/movieclaw/cli/internal/wait"
 )
 
 // NewLibraryGroup 构造 `mclaw library` 组；生成层随后并入其余媒体库命令。

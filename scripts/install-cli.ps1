@@ -5,7 +5,7 @@ movieclaw CLI（mclaw）Windows 安装脚本（docs/design/device-auth.md §6.4�
 .DESCRIPTION
 在 PowerShell 里一行装好：
 
-    irm https://raw.githubusercontent.com/yipengfei329/movieclaw/main/scripts/install-cli.ps1 | iex
+    irm https://raw.githubusercontent.com/movieclaw/movieclaw/main/scripts/install-cli.ps1 | iex
 
 mclaw 是一个静态二进制，装它不需要 Python、Node 或任何包管理器。
 
@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repo = 'yipengfei329/movieclaw'
+$repo = 'movieclaw/movieclaw'
 if (-not $Version) { $Version = 'latest' }
 if (-not $DownloadBase) { $DownloadBase = "https://github.com/$repo/releases" }
 

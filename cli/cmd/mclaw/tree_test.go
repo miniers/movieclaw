@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yipengfei329/movieclaw/cli/internal/overlay"
+	"github.com/movieclaw/movieclaw/cli/internal/overlay"
 )
 
 // fullTreeSnapshot 是「精选层 + 生成层」装配完成后的整棵命令树（含分组名），

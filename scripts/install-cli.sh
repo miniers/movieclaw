@@ -1,7 +1,7 @@
 #!/bin/sh
 # movieclaw CLI（mclaw）安装脚本（docs/design/device-auth.md §6.4）
 #
-#     curl -fsSL https://raw.githubusercontent.com/yipengfei329/movieclaw/main/scripts/install-cli.sh | sh
+#     curl -fsSL https://raw.githubusercontent.com/movieclaw/movieclaw/main/scripts/install-cli.sh | sh
 #
 # mclaw 是一个静态二进制：下载、解压、放进 PATH，就这三步。不需要 Python、
 # 不需要 Node、不需要包管理器——CLI 要装在 NAS、软路由、同事的机器和 CI 里，
@@ -12,7 +12,7 @@
 # 都能连」的前提是 mclaw 首先得被找得到。
 set -eu
 
-REPO="yipengfei329/movieclaw"
+REPO="movieclaw/movieclaw"
 VERSION="${MOVIECLAW_CLI_VERSION:-latest}"
 # 国内网络可用 MOVIECLAW_DOWNLOAD_BASE 换成 GitHub 加速镜像
 BASE="${MOVIECLAW_DOWNLOAD_BASE:-https://github.com/$REPO/releases}"

@@ -4,9 +4,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yipengfei329/movieclaw/cli/internal/flagx"
-	"github.com/yipengfei329/movieclaw/cli/internal/output"
-	"github.com/yipengfei329/movieclaw/cli/internal/wait"
+	"github.com/movieclaw/movieclaw/cli/internal/flagx"
+	"github.com/movieclaw/movieclaw/cli/internal/output"
+	"github.com/movieclaw/movieclaw/cli/internal/wait"
 )
 
 // NewJobsGroup 构造 `mclaw jobs` 组；生成层随后并入 list / show / cancel 等命令。

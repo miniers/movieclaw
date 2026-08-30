@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
 )
 
 const testServer = "http://10.1.1.5:3000"

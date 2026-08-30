@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/spec"
+	"github.com/movieclaw/movieclaw/cli/internal/spec"
 )
 
 // simpleTypes 是能直接映射成一个标志的 JSON 类型；其余（对象、数组）收折为

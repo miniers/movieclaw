@@ -1,4 +1,4 @@
-module github.com/yipengfei329/movieclaw/cli
+module github.com/movieclaw/movieclaw/cli
 
 go 1.25.0
 

@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
-	"github.com/yipengfei329/movieclaw/cli/internal/spec"
+	"github.com/movieclaw/movieclaw/cli/internal/spec"
 )
 
 // snapshotPath 是生成命令的清单快照：路由增删改必然反映为这里的 diff，

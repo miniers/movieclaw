@@ -54,7 +54,7 @@
 
 ```
 cli/
-├── go.mod                       module github.com/yipengfei329/movieclaw/cli （go 1.24）
+├── go.mod                       module github.com/movieclaw/movieclaw/cli （go 1.24）
 ├── .goreleaser.yaml             多平台构建与分发
 ├── cmd/mclaw/main.go            唯一入口：装配 root 命令、全局标志、退出码收口
 ├── internal/

@@ -22,8 +22,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/clierr"
-	"github.com/yipengfei329/movieclaw/cli/internal/config"
+	"github.com/movieclaw/movieclaw/cli/internal/clierr"
+	"github.com/movieclaw/movieclaw/cli/internal/config"
 )
 
 // EnvSpecFile 让部署方显式指定 spec 文件（镜像内由 entrypoint 设置）。

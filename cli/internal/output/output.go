@@ -18,7 +18,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/yipengfei329/movieclaw/cli/internal/jsonval"
+	"github.com/movieclaw/movieclaw/cli/internal/jsonval"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
