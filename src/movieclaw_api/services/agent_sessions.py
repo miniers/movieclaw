@@ -38,9 +38,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from movieclaw_agent import CompactionResult
+from movieclaw_agent import CompactionResult, strip_skill_blocks
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
-from movieclaw_llm import ChatMessage, TokenUsage, ToolCall
+from movieclaw_llm import ChatMessage, ImagePart, TextPart, TokenUsage, ToolCall
 
 logger = logging.getLogger("movieclaw_api.agent_sessions")
 
@@ -50,6 +50,20 @@ SESSION_FORMAT_VERSION = 3
 
 #: 会话标题 / 最后提示预览的截断长度（DB 索引列用，全文始终在文件里）
 PREVIEW_MAX_CHARS = 80
+
+#: 中断收尾的来源分级（决定合成回执的文案，见 seal_pending_tool_calls）
+SealReason = Literal["user_cancelled", "service_interrupted"]
+
+_SEAL_TEXTS: dict[str, str] = {
+    "user_cancelled": (
+        "用户停止了本次运行，此工具调用被中断。它可能已产生部分效果；"
+        "如需确认实际结果，请先用查询类操作核实，不要盲目重发。"
+    ),
+    "service_interrupted": (
+        "运行被中断（服务重启或异常），此工具调用的结果未知。"
+        "继续任务前请先查询相关状态确认它是否已生效，避免重复执行有副作用的操作。"
+    ),
+}
 
 
 def _now_iso() -> str:
@@ -86,6 +100,10 @@ class SessionMessageEntry(BaseModel):
     model: str | None = None
     usage: TokenUsage | None = None
     finish_reason: str | None = None
+    #: 仅 user 消息携带：这条消息生效的思维链档位（None = 默认）。会话的
+    #: 「当前档位」= 最近一条 user 行的值（与压缩接口沿用最近模型同一先例），
+    #: 不给 agent_session 表加列。老读端忽略该字段（向前兼容）。
+    thinking_level: str | None = None
 
 
 class SessionCompactionEntry(BaseModel):
@@ -150,6 +168,103 @@ class SessionSummary(BaseModel):
     last_timestamp: str
 
 
+def dehydrate_message(message: ChatMessage) -> ChatMessage:
+    """落库脱水（引用化的不变量守门员，docs/design/agent-image-input.md §6）。
+
+    发请求前的水合会给引用型 ImagePart 补上 base64 字节、给带图 user 消息
+    追加附件清单文本；两者都只属于请求投影。压缩行的 replacement_history
+    来自运行内已水合的消息，不在这里剥掉就会把几 MB base64 写进转录。
+    规则：
+
+    - 带 attachment_id 的 ImagePart 一律置 data=None（字节的事实源在
+      assets 目录，转录只存引用）；
+    - 附件清单文本（固定前缀，见 agent_attachments.ATTACHMENT_NOTE_PREFIX）
+      仅在消息**同时含图**时剥除——用户自己打出前缀文字的纯文本消息不受
+      影响。
+
+    应用在本 store 的全部写入口（append / append_compaction / append_handoff），
+    store 是唯一写盘口，守在这里才覆盖手动压缩等不经 recorder 的路径。
+    """
+    from movieclaw_api.services.agent_attachments import ATTACHMENT_NOTE_PREFIX
+
+    if not isinstance(message.content, list):
+        return message
+    has_image = any(isinstance(p, ImagePart) for p in message.content)
+    changed = False
+    parts = []
+    for part in message.content:
+        if isinstance(part, ImagePart) and part.attachment_id and part.data is not None:
+            parts.append(part.model_copy(update={"data": None}))
+            changed = True
+            continue
+        if (
+            has_image
+            and isinstance(part, TextPart)
+            and part.text.startswith(ATTACHMENT_NOTE_PREFIX)
+        ):
+            changed = True
+            continue
+        parts.append(part)
+    return message.model_copy(update={"content": parts}) if changed else message
+
+
+def latest_user_thinking_level(
+    entries: list[SessionMessageEntry | SessionCompactionEntry | SessionHandoffEntry],
+) -> str | None:
+    """会话当前生效的思维链档位：最近一条 user 行的信封值（None = 默认）。
+
+    续聊未显式传档位时沿用它——与手动压缩「沿用会话最近一次使用的模型」
+    同一口径。没有任何 user 行（新会话/纯交接会话）即默认。
+    """
+    for entry in reversed(entries):
+        if isinstance(entry, SessionMessageEntry) and entry.message.role == "user":
+            return entry.thinking_level
+    return None
+
+
+def message_preview(message: ChatMessage) -> str:
+    """消息的列表预览文本：正文优先，纯图消息用「[图片]」占位。
+
+    显式技能调用的展开块（<skill> 开头的 user 消息）替换为「[技能]」占位，
+    预览只留用户自己的话——与图片占位同一思路。
+
+    供会话标题 / last_prompt 使用（summarize 与 recorder 共用同一口径，
+    重建索引与实时写入才不会出现两种预览）。
+    """
+    text = message.text().strip()
+    if text:
+        skill_names, rest = strip_skill_blocks(text)
+        if skill_names:
+            return f"[技能] {rest}".strip()
+        return text
+    if isinstance(message.content, list):
+        images = sum(1 for p in message.content if isinstance(p, ImagePart))
+        if images == 1:
+            return "[图片]"
+        if images > 1:
+            return f"[图片 ×{images}]"
+    return ""
+
+
+def _repair_unpaired_tool_messages(
+    session_id: str, messages: list[ChatMessage]
+) -> list[ChatMessage]:
+    """读取侧最后防线：把未配对的 tool_call / tool 回执修复成协议完整的历史。
+
+    复用交接快照的修复逻辑（补「结果未知」回执 / 降级孤立回执），只在
+    内存里的投影上生效，不回写文件。命中即记错误日志——正常部署下写入侧
+    seal 保证这里永远是直通路径（docs/design/agent-runtime-resilience.md §4.2）。
+    """
+    repaired = _repair_handoff_history(messages)
+    if repaired != messages:
+        logger.error(
+            "会话 %s 重建上下文时发现未配对的工具消息，已在内存中修复"
+            "（正常情况下写入侧收尾应保证配对完整，请检查日志中的中断收尾记录）",
+            session_id,
+        )
+    return repaired
+
+
 def _last_context_boundary_index(
     entries: list[SessionMessageEntry | SessionCompactionEntry | SessionHandoffEntry],
 ) -> int:
@@ -169,12 +284,13 @@ def _messages_after_last_compaction(
 
 
 def _repair_handoff_history(history: list[ChatMessage]) -> list[ChatMessage]:
-    """为新会话复制一份协议完整的历史，不修改源会话。
+    """复制一份协议完整的历史，不修改源数据（交接快照与读取侧兜底共用）。
 
-    硬崩可能留下 assistant tool_call 却没有 tool 回执；原会话直接续聊时部分
-    供应商会因此拒绝整次请求。交接快照在每个缺口处补一条「结果未知」，提醒
-    新 Agent 先查询真实状态，不能武断地把外部操作判成未执行。孤立 tool 回执
+    硬崩可能留下 assistant tool_call 却没有 tool 回执；直接回喂时部分
+    供应商会因此拒绝整次请求。在每个缺口处补一条「结果未知」，提醒
+    Agent 先查询真实状态，不能武断地把外部操作判成未执行。孤立 tool 回执
     则降级成普通历史说明，既保住信息，也不把非法 tool 消息喂给供应商。
+    无缺口时逐条原样返回（调用方可用相等比较判断是否发生过修复）。
     """
     repaired: list[ChatMessage] = []
     pending: list[ToolCall] = []
@@ -185,7 +301,7 @@ def _repair_handoff_history(history: list[ChatMessage]) -> list[ChatMessage]:
                 ChatMessage(
                     role="tool",
                     content=(
-                        f"旧会话在此处异常中断，工具「{tool_call.name}」的结果未知。"
+                        f"会话在此处异常中断，工具「{tool_call.name}」的结果未知。"
                         "继续前请先查询实际状态，避免重复操作。"
                     ),
                     tool_call_id=tool_call.id,
@@ -211,7 +327,7 @@ def _repair_handoff_history(history: list[ChatMessage]) -> list[ChatMessage]:
                     ChatMessage(
                         role="user",
                         content=(
-                            f"【旧会话中的孤立工具回执：{message.name or '未知工具'}】\n"
+                            f"【历史中的孤立工具回执：{message.name or '未知工具'}】\n"
                             f"{message.text()}"
                         ),
                     )
@@ -242,6 +358,11 @@ class AgentSessionStore:
         #: session_id → 最后一条 entry 的 uuid（避免每次 append 都重读文件）
         self._leaf_cache: dict[str, str | None] = {}
 
+    @property
+    def root(self) -> Path:
+        """转录目录（启动自愈遍历用）。"""
+        return self._root
+
     def path(self, session_id: str) -> Path:
         return self._root / f"{session_id}.jsonl"
 
@@ -270,6 +391,7 @@ class AgentSessionStore:
         model: str | None = None,
         usage: TokenUsage | None = None,
         finish_reason: str | None = None,
+        thinking_level: str | None = None,
     ) -> SessionMessageEntry:
         """追加一条定稿消息，自动接到当前链尾，返回写入的 entry。"""
         path = self.path(session_id)
@@ -282,10 +404,11 @@ class AgentSessionStore:
             uuid=uuid_mod.uuid4().hex[:12],
             parent_uuid=self._leaf_cache[session_id],
             timestamp=_now_iso(),
-            message=message,
+            message=dehydrate_message(message),
             model=model,
             usage=usage,
             finish_reason=finish_reason,
+            thinking_level=thinking_level,
         )
         with path.open("a", encoding="utf-8") as f:
             f.write(entry.model_dump_json(exclude_none=True) + "\n")
@@ -307,7 +430,7 @@ class AgentSessionStore:
             parent_uuid=self._leaf_cache[session_id],
             timestamp=_now_iso(),
             summary=result.summary,
-            replacement_history=result.replacement_history,
+            replacement_history=[dehydrate_message(m) for m in result.replacement_history],
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
         )
@@ -339,7 +462,7 @@ class AgentSessionStore:
             source_session_id=source_session_id,
             source_leaf_uuid=source_leaf_uuid,
             source_title=source_title,
-            replacement_history=replacement_history,
+            replacement_history=[dehydrate_message(m) for m in replacement_history],
         )
         with path.open("a", encoding="utf-8") as f:
             f.write(entry.model_dump_json(exclude_none=True) + "\n")
@@ -369,15 +492,22 @@ class AgentSessionStore:
         )
         return header, handoff
 
-    def seal_pending_tool_calls(self, session_id: str) -> int:
+    def seal_pending_tool_calls(
+        self, session_id: str, *, reason: SealReason = "user_cancelled"
+    ) -> int:
         """中断收尾：给没有结果的 tool_call 补写错误回执，返回补写条数。
 
         保证文件里 assistant 的 tool_calls 与 tool 消息任何时刻都配对完整，
         resume 直接回喂 API 不需要修复逻辑（Claude Code 是吃到 400 再反应式
         修复，我们在写入侧一次做对更省事）。
 
+        文案按中断来源分级（docs/design/agent-runtime-resilience.md §4.3）：
+        两种场景下工具都**可能已产生副作用**（提交下载、创建订阅），合成
+        回执必须表达「结果未知、先查询核实」，绝不能断言「未执行」——
+        否则模型会盲目重发，副作用工具被重复执行。
+
         只检查最后一条压缩行之后的消息：更早的往返已被压缩挡在上下文之外，
-        给死上下文补回执毫无意义。
+        给死上下文补回执毫无意义。幂等：无孤儿时零写入。
         """
         _, entries, _ = self._read(self.path(session_id))
         messages = _messages_after_last_compaction(entries)
@@ -391,7 +521,7 @@ class AgentSessionStore:
                     session_id,
                     ChatMessage(
                         role="tool",
-                        content="操作已被中断，工具未执行完成。",
+                        content=_SEAL_TEXTS[reason],
                         tool_call_id=tc.id,
                         name=tc.name,
                     ),
@@ -475,15 +605,21 @@ class AgentSessionStore:
         有压缩或交接行时，从**最后一个**上下文边界的替换历史起步、只追加
         其后的增量消息。交接因此只在新会话文件里保存一次快照，之后与普通
         会话完全相同，不再读取源文件。
+
+        末端过一道读取侧防线（maka 回放层的成对丢弃）：写入侧 seal 的
+        双保险生效后这里理论上永远命中 0，但绝不把必被供应商拒绝的
+        非法配对发出去——防御纵深的最后一层。
         """
         _, entries = self.read(session_id)
         last = _last_context_boundary_index(entries)
         if last < 0:
-            return [e.message for e in entries if isinstance(e, SessionMessageEntry)]
-        return [
-            *entries[last].replacement_history,
-            *(e.message for e in entries[last + 1 :] if isinstance(e, SessionMessageEntry)),
-        ]
+            messages = [e.message for e in entries if isinstance(e, SessionMessageEntry)]
+        else:
+            messages = [
+                *entries[last].replacement_history,
+                *(e.message for e in entries[last + 1 :] if isinstance(e, SessionMessageEntry)),
+            ]
+        return _repair_unpaired_tool_messages(session_id, messages)
 
     def summarize(self, session_id: str) -> SessionSummary:
         """扫描单个会话文件生成索引摘要。"""
@@ -492,11 +628,11 @@ class AgentSessionStore:
         # 回填的口径一致，用户后续发言不覆盖标题，重建索引时也保持同一语义。
         # 压缩/交接行都计入 entry_count 与链尾，但不伪造 last_prompt。
         user_texts = [
-            e.message.text().strip()
+            message_preview(e.message)
             for e in entries
             if isinstance(e, SessionMessageEntry)
             and e.message.role == "user"
-            and e.message.text().strip()
+            and message_preview(e.message)
         ]
         handoff_title = next(
             (

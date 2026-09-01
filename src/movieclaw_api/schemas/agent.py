@@ -3,12 +3,31 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, field_serializer, field_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models import AgentSession
 from movieclaw_db.repositories.agent_session_repo import is_running
 from movieclaw_llm import ChatMessage, ContentPart, TokenUsage, ToolCall
+from movieclaw_llm.models import THINKING_LEVELS
+
+#: 思维链档位的对外取值：词汇表 + 「default」（显式清回模型默认）。
+#: None/未传 = 沿用会话最近一条 user 消息的档位。
+_THINKING_LEVEL_CHOICES = {*THINKING_LEVELS, "default"}
+
+
+def _validate_thinking_level(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value not in _THINKING_LEVEL_CHOICES:
+        raise ValueError(
+            f"思维链档位「{value}」不在支持的取值里："
+            f"{', '.join(sorted(_THINKING_LEVEL_CHOICES))}"
+        )
+    return value
 
 
 def _iso_utc(value: datetime | None) -> str | None:
@@ -21,11 +40,23 @@ def _iso_utc(value: datetime | None) -> str | None:
 
 
 class SessionStartPayload(BaseModel):
-    """提交一条用户消息；有 session_id 时继续已有会话，否则开始新会话。"""
+    """提交一条用户消息；有 session_id 时继续已有会话，否则开始新会话。
+
+    图片以 attachment_id 引用（先经 ``session.attachments.upload`` 上传）；
+    协议永不接受调用方直接提交内容块——ContentPart 由服务端组装，杜绝注入
+    任意 url 或内联 base64（docs/design/agent-image-input.md §8.1）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    content: str = Field(min_length=1, max_length=4000, description="用户消息正文")
+    content: str = Field(
+        default="", max_length=4000, description="用户消息正文；带图片时允许为空"
+    )
+    attachments: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+        description="随消息发送的图片附件编号列表（上传接口返回的 attachment_id）",
+    )
     session_id: str | None = Field(
         default=None,
         min_length=1,
@@ -33,11 +64,47 @@ class SessionStartPayload(BaseModel):
         description="已有会话编号；留空时创建新会话",
     )
     model: str = Field(default="", description="模型 ID；留空时使用默认供应商的默认模型")
+    thinking_level: str | None = Field(
+        default=None,
+        description=(
+            "思维链强度档位（off/minimal/low/medium/high/xhigh/max），"
+            "传 default 显式清回模型默认；不传时沿用会话最近一条消息的档位"
+        ),
+    )
 
     @field_validator("content", "session_id", "model", mode="before")
     @classmethod
     def _strip(cls, value: str | None) -> str | None:
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("thinking_level")
+    @classmethod
+    def _thinking_level_vocab(cls, value: str | None) -> str | None:
+        return _validate_thinking_level(value)
+
+    @model_validator(mode="after")
+    def _require_content_or_attachments(self) -> SessionStartPayload:
+        if not self.content and not self.attachments:
+            raise ValueError("消息正文与图片附件不能同时为空")
+        return self
+
+
+class AttachmentUploadView(BaseModel):
+    """图片附件上传成功的回执；attachment_id 随后交给 session.start 引用。"""
+
+    attachment_id: str = Field(description="附件稳定编号，绑定会话前 24 小时内有效")
+    name: str = Field(description="原始文件名（服务端截断到 120 字符）")
+    width: int = Field(description="图片像素宽度")
+    height: int = Field(description="图片像素高度")
+    bytes: int = Field(description="原始字节数")
+
+
+class SkillView(BaseModel):
+    """一个可显式调用的 Agent 技能（composer 加号菜单的数据源）。"""
+
+    name: str = Field(description="技能名，也是 /skill:名字 占位符里的名字")
+    description: str = Field(description="技能用途描述（菜单项的提示文案）")
+    scope: str = Field(description="来源层级：builtin=随产品内置，user=用户技能目录")
 
 
 class SessionMessageAcceptedView(BaseModel):
@@ -65,12 +132,29 @@ class SessionRetryPayload(BaseModel):
         max_length=4000,
         description="替换后的用户消息正文；留空时原文重试",
     )
+    attachments: list[str] | None = Field(
+        default=None,
+        max_length=4,
+        description=(
+            "重试消息携带的图片附件编号：不传（null）沿用原消息的附件，"
+            "空数组显式去掉图片，非空数组替换为新附件"
+        ),
+    )
     model: str = Field(default="", description="模型 ID；留空时使用默认供应商的默认模型")
+    thinking_level: str | None = Field(
+        default=None,
+        description="思维链强度档位；传 default 清回模型默认，不传沿用原消息的档位",
+    )
 
     @field_validator("message_id", "content", "model", mode="before")
     @classmethod
     def _strip(cls, value: str | None) -> str | None:
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("thinking_level")
+    @classmethod
+    def _thinking_level_vocab(cls, value: str | None) -> str | None:
+        return _validate_thinking_level(value)
 
 
 class SessionRenamePayload(BaseModel):
@@ -140,7 +224,18 @@ class SessionMessageView(BaseModel):
 
     @classmethod
     def from_model(cls, message: ChatMessage) -> SessionMessageView:
-        return cls.model_validate(message.model_dump())
+        dumped = message.model_dump()
+        # 防御性剔除图片字节：落库脱水（store 写入口）之外的第二道闸。
+        # 老数据或异常路径里若混入内联 base64，也不能把几 MB 推给前端——
+        # 引用型图片块的展示只依赖 attachment_id（下载接口取图）。
+        content = dumped.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "image" and part.get("attachment_id"):
+                    part["data"] = None
+        return cls.model_validate(dumped)
 
 
 class SessionMessageEntryView(BaseModel):
@@ -155,6 +250,9 @@ class SessionMessageEntryView(BaseModel):
     usage: TokenUsage | None = Field(default=None, description="assistant 消息的 token 用量")
     finish_reason: str | None = Field(
         default=None, description="assistant 消息的模型结束原因"
+    )
+    thinking_level: str | None = Field(
+        default=None, description="user 消息生效的思维链档位；null = 模型默认"
     )
 
 

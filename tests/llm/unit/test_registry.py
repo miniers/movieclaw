@@ -31,10 +31,22 @@ def test_bailian_preset_dialect():
     assert preset.protocol == "openai_chat"
     assert preset.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert preset.compat.thinking_field == "reasoning_content"
-    flagship = next(m for m in preset.models if m.id == "qwen3.7-max")
+    flagship = next(m for m in preset.models if m.id == "qwen3.8-max")
     assert flagship.supports_thinking
     assert flagship.max_thinking_tokens == 262144
-    assert flagship.max_output_tokens == 65536
+    assert flagship.max_output_tokens == 131072
+    # 3.8 代起旗舰原生多模态；上代 qwen3.7-max 仍在售（多处测试以它为默认模型）
+    assert flagship.modalities == ["text", "image", "video"]
+    assert any(m.id == "qwen3.7-max" for m in preset.models)
+
+
+def test_preset_model_ids_have_no_slash():
+    """模型 id 含「/」会与路由 ref 的「实例名/模型id」语法冲突：resolve 会把
+    id 前半段当实例名解析失败（如百炼的 ZHIPU/GLM-5.3，见 bailian.yaml 注释），
+    这类模型不允许进预设目录。"""
+    for preset in list_presets():
+        for model in preset.models:
+            assert "/" not in model.id, f"{preset.id} 目录里的 {model.id} 含保留字符「/」"
 
 
 def test_unknown_preset_raises_chinese_error():

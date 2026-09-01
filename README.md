@@ -156,6 +156,7 @@ endpoint). Skip it and everything else still works.
 - Talk to your library from WeChat — "subscribe to Three-Body season 2 as soon as it's out" — by text or voice. Telegram and Discord work too.
 - Under the hood, the assistant drives MovieClaw's own CLI rather than guessing at APIs. Ship a new backend endpoint and the assistant gains that ability automatically; long conversations compact their own context. The same CLI is [yours to install](#control-it-from-anywhere) — on any machine, for any agent.
 - Missing subtitles? It makes its own: when none exist in your target language, it finds subtitles in another language, translates them, and saves the result as an external SRT next to the video.
+- Teach it "skills" in plain Markdown: drop a directory with a `SKILL.md` into `data/agent-skills/` (a `description` in the frontmatter, instructions in the body, scripts welcome) and the assistant loads it on its own whenever a web-session task matches — changes take effect immediately, no restart. A skill sharing a name with a built-in one overrides it (the log says so). Details in [`docs/design/agent-skills.md`](docs/design/agent-skills.md).
 
 What the assistant is and isn't allowed to do is covered next.
 
@@ -550,6 +551,12 @@ Without the model, the app runs fine — that one feature just stays off. The fi
 extraction is actually triggered, the log notes that the model is missing and that
 title/year/season/episode fields will stay empty. But that warning is emitted **lazily**:
 it never appears at startup, so a clean boot log is not proof the model is in place.
+
+One more known boundary when running from source: if the process is killed in a way that
+allows no cleanup — `kill -9`, a power cut — while the AI assistant is executing a command,
+the subprocesses it spawned may be left running (normal shutdown, timeouts, and the user's
+stop button all reap the whole process group, and under Docker a container restart cleans
+up as well). After a hard crash on bare metal, a quick `ps` check for leftovers is worth it.
 
 ## Docs & Support
 

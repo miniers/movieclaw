@@ -17,10 +17,16 @@ import {
   type AgentConversation,
   type AgentProcessItem,
   type AgentTurn,
+  type AgentTurnImage,
   type AgentTurnSegment,
   type AgentTurnToolCall,
   useAgentConversations,
 } from "@/lib/agent-conversations";
+import type { ComposerImage } from "@/lib/agent-attachments";
+import { parseSkillTokens } from "@/lib/agent-skills";
+import { useSkillNames } from "@/lib/skill-names";
+import { sessionAttachmentUrl } from "@/lib/api/agent";
+import { useDefaultModelThinkingLevels } from "@/lib/llm-thinking";
 import { usePageChrome } from "@/lib/page-chrome";
 import { usePageTitle } from "@/lib/use-page-title";
 
@@ -51,6 +57,11 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
     return chrome.setTopBarTitle(title);
   }, [chrome, title]);
   const [input, setInput] = useState("");
+  // 思维链档位：undefined = 用户没动过选择器（发送时不传，服务端沿用会话
+  // 上一条）；null = 显式「默认」；string = 显式档位。展示值回落到会话最近
+  // 一轮的档位（转录信封回放）。
+  const [thinkingChoice, setThinkingChoice] = useState<string | null | undefined>(undefined);
+  const thinkingLevels = useDefaultModelThinkingLevels();
   const [retryTarget, setRetryTarget] = useState<{
     conversationId: string;
     messageId: string;
@@ -127,11 +138,26 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
   }
 
   const running = conversation.turns.some((t) => t.status === "running");
+  // 会话当前生效的档位 = 最近一轮的信封值（乐观轮次可能没有，取最近的有值项）
+  const sessionThinkingLevel =
+    [...conversation.turns].reverse().find((t) => t.thinkingLevel !== undefined)
+      ?.thinkingLevel ?? null;
+  const displayedThinking = thinkingChoice === undefined ? sessionThinkingLevel : thinkingChoice;
 
-  function submit(text: string) {
+  function submit(text: string, images: ComposerImage[]) {
     if (!activeRetryTarget) {
       setInput("");
-      send(conversationId, text);
+      send(
+        conversationId,
+        text,
+        images.map((image) => ({
+          attachmentId: image.attachmentId,
+          name: image.name,
+          previewUrl: image.previewUrl,
+        })),
+        // 没动过选择器就不传（服务端沿用）；动过则显式传档位或 "default"
+        thinkingChoice === undefined ? undefined : (thinkingChoice ?? "default"),
+      );
       return;
     }
     void (async () => {
@@ -192,6 +218,7 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
               <TurnView
                 key={turn.id}
                 turn={turn}
+                sessionId={conversationId}
                 onEdit={running || retrying ? undefined : handleEdit}
               />
             ))}
@@ -238,6 +265,13 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
             value={input}
             onChange={setInput}
             onSubmit={submit}
+            // 改写模式不开图片入口：retry 默认沿用原消息的图，此时新加的图
+            // 无处安放，藏起入口比静默丢弃诚实
+            imageUpload={!activeRetryTarget}
+            skillPicker
+            thinkingLevels={thinkingLevels}
+            thinkingValue={displayedThinking}
+            onThinkingChange={setThinkingChoice}
             busy={running}
             onStop={() => stop(conversationId)}
             disabled={locked || (retrying && activeRetryTarget != null)}
@@ -289,9 +323,12 @@ function HandoffCard({
  *  重建全部历史轮次的元素树。 */
 const TurnView = memo(function TurnView({
   turn,
+  sessionId,
   onEdit,
 }: {
   turn: AgentTurn;
+  /** 会话 id：气泡里的图片按它拼附件下载地址 */
+  sessionId: string;
   /** 改写本轮重问；不给（运行中）则气泡上不出现该入口 */
   onEdit?: (messageId: string, input: string) => void;
 }) {
@@ -301,6 +338,8 @@ const TurnView = memo(function TurnView({
       {/* 用户消息：右侧玻璃气泡 */}
       <UserBubble
         text={turn.input}
+        images={turn.images}
+        sessionId={sessionId}
         onEdit={onEdit && messageId ? () => onEdit(messageId, turn.input) : undefined}
       />
 
@@ -349,8 +388,27 @@ const TurnView = memo(function TurnView({
  * flex-row-reverse：DOM 顺序保持「先正文、后操作」（读屏与 Tab 顺序更自然），
  * 视觉上仍是气泡贴右、操作键在它左边。
  */
-function UserBubble({ text, onEdit }: { text: string; onEdit?: () => void }) {
+function UserBubble({
+  text,
+  images,
+  sessionId,
+  onEdit,
+}: {
+  text: string;
+  images?: AgentTurnImage[];
+  sessionId: string;
+  onEdit?: () => void;
+}) {
   const { revealProps, toggle } = useTapReveal();
+  // /skill:名字 占位符渲染成技能 chip，正文只留用户自己的话（复制与
+  // 改写重问仍用完整的 token 形态原文）。只拆已知技能：拼错/不存在的
+  // token 服务端不会展开，气泡保留字面文本，不冒充「已调用」的 chip；
+  // 名单加载完成前（null）暂不过滤，避免 chip 闪烁成字面文本
+  const knownSkills = useSkillNames();
+  const { names: skillNames, text: plainText } = parseSkillTokens(
+    text,
+    knownSkills ?? undefined,
+  );
   return (
     <div className="group/copy flex flex-row-reverse items-end justify-start" {...revealProps}>
       {/* 触摸端点气泡浮现操作键（桌面端靠 hover，这一下点击是多余但无害的）。
@@ -359,7 +417,43 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: () => void }) {
         onClick={toggle}
         className="selectable max-w-[80%] whitespace-pre-wrap break-words rounded-2xl bg-[var(--glass-fill-active)] px-4 py-3 text-body leading-6 text-[var(--text)]"
       >
-        {text}
+        {skillNames.length > 0 && (
+          <span
+            className={`flex flex-wrap gap-1.5 ${plainText || images?.length ? "mb-2" : ""}`}
+          >
+            {skillNames.map((name) => (
+              <span
+                key={name}
+                className="inline-flex items-center gap-1 rounded-lg bg-white/[0.08] px-2 py-0.5 text-caption text-[var(--text-muted)]"
+              >
+                ⚡ {name}
+              </span>
+            ))}
+          </span>
+        )}
+        {images && images.length > 0 && (
+          <span className={`flex flex-wrap gap-2 ${plainText ? "mb-2" : ""}`}>
+            {images.map((image) => (
+              // 乐观渲染优先本地 objectURL；回放走附件下载接口（immutable 缓存）。
+              // 点击开新页看原图——转录页不再实现单独的灯箱。
+              <a
+                key={image.attachmentId}
+                href={image.previewUrl ?? sessionAttachmentUrl(sessionId, image.attachmentId)}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <img
+                  src={image.previewUrl ?? sessionAttachmentUrl(sessionId, image.attachmentId)}
+                  alt={image.name ?? "图片"}
+                  loading="lazy"
+                  className="max-h-40 max-w-[200px] rounded-lg border border-white/10 object-cover"
+                />
+              </a>
+            ))}
+          </span>
+        )}
+        {plainText}
       </div>
       <CopyButton
         text={text}
@@ -439,11 +533,12 @@ function TurnFooter({ turn }: { turn: AgentTurn }) {
     .map((segment) => segment.text)
     .join("\n\n")
     .trim();
-  if (!duration && !turn.stopped && !answer) return null;
+  if (!duration && !turn.stopped && !turn.interrupted && !answer) return null;
 
   return (
     <div className="flex items-center gap-2 text-caption text-[var(--text-faint)]">
       {turn.stopped && <span>已停止</span>}
+      {!turn.stopped && turn.interrupted && <span title="本轮运行未正常结束（停机或异常中断），可直接继续对话">已中断</span>}
       {duration && (
         <span
           className="tabular-nums"

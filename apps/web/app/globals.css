@@ -632,6 +632,18 @@ a {
     inset 0 0 0 1px color-mix(in srgb, var(--accent-ring) 55%, transparent);
 }
 
+/* composer 输入框里的技能 token（Lexical SkillTokenNode）：
+   与会话气泡里的技能 chip 同一视觉语言，行内原子实体、整体删除 */
+.skill-token-chip {
+  background: rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  padding: 1px 6px;
+  margin: 0 1px;
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  white-space: nowrap;
+}
+
 /* 数字等宽（时间、计数），排版更整齐 */
 .tnum {
   font-variant-numeric: tabular-nums;
@@ -942,16 +954,43 @@ a {
  */
 .menu-surface {
   position: relative;
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 46%),
-    rgb(20 23 31 / 0.97);
-  backdrop-filter: blur(22px) saturate(1.4);
+  border-radius: 14px;
+  /* v2（2026-08-31，与播放器菜单同思路的纯色浮层）：纯色近实底 + 单层
+     投影，去掉 backdrop-filter / 描边 / 渐变高光 / 内嵌高光。理由与播放
+     器菜单一致（见 player-controls 的菜单注释）：模糊会把背景纹理与颜色
+     洇进面板、跟着背景变色，视觉重且是 GPU 合成大户；纯色底在任何海报/
+     背景上观感恒定，投影独自负责「浮起」。
+     亮度是三轮真机比稿的落点：比界面底「略亮半档」。照抄播放器的暗浮层
+     （black/85 压亮视频才有对比）会与深色界面顺色；按暗色 elevation 惯例
+     大幅提亮（30 33 40）又发灰、丢了沉稳质感。21 23 29 介于两者之间，
+     配 8% 发丝线，边界清楚且保留暗色气质。
+     由此形成两层设计语言：玻璃 = 界面结构（composer/侧栏/面板），
+     纯色 = 临时浮层（菜单、弹窗）。 */
+  background: rgb(21 23 29 / 0.96);
+  /* 单层外投影负责「浮起」；一条 6% 发丝内线负责深底叠深底（菜单压在
+     侧栏/composer 上）时的边界分离——播放器菜单不需要它是因为视频画面
+     自带对比，站内深叠深场景值得这一线。比旧版 10% 描边细一半、无渐变 */
   box-shadow:
     0 18px 44px rgba(0, 0, 0, 0.5),
-    0 2px 8px rgba(0, 0, 0, 0.32),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  /* 进场与播放器调节胶囊同节奏（0.16s）；从中心极小缩放起——全站菜单
+     向上/向下弹的都有，中心起在任何方向都不违和 */
+  animation: menu-surface-in 0.16s ease both;
+}
+@keyframes menu-surface-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .menu-surface {
+    animation: none;
+  }
 }
 
 /*

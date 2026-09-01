@@ -37,12 +37,14 @@ from movieclaw_llm.models import (
     FinishReason,
     ImagePart,
     LlmProviderConfig,
+    ModelInfo,
     ProviderInfo,
     ProviderPreset,
     TextPart,
     TokenUsage,
     ToolCall,
 )
+from movieclaw_llm.thinking import thinking_body_fragment
 from movieclaw_llm.tools import HARMONY_RESIDUE_HINT, has_harmony_residue
 from movieclaw_net import egress_transport
 
@@ -97,6 +99,21 @@ class OpenAIChatProtocol(BaseLlmProtocol):
 
     # -- 请求转换 -----------------------------------------------------------
 
+    def _model_info(self, model_id: str) -> ModelInfo | None:
+        """按 id 查模型声明：用户补录（extra_models）优先于预设目录。
+
+        与 LlmRouter._catalog 同一合并口径；思考档位翻译靠它拿
+        thinking_control / max_thinking_tokens。目录外模型返回 None——
+        fail-closed，档位不落请求。
+        """
+        for model in self.config.extra_models:
+            if model.id == model_id:
+                return model
+        for model in self.preset.models:
+            if model.id == model_id:
+                return model
+        return None
+
     def _convert_content(self, message: ChatMessage) -> str | list[dict] | None:
         """内容块 → OpenAI 格式。纯文本尽量压成字符串（兼容端点最稳）。"""
         if isinstance(message.content, str):
@@ -107,6 +124,17 @@ class OpenAIChatProtocol(BaseLlmProtocol):
             if isinstance(part, TextPart):
                 parts.append({"type": "text", "text": part.text})
             elif isinstance(part, ImagePart):
+                if not part.url and not part.data:
+                    # 未水合的引用块（只有 attachment_id）：上游水合层漏了它。
+                    # fail-safe：降级为占位文本——宁可丢一张图，也不把内部
+                    # 引用漏给供应商（发出去必然 4xx，还暴露内部标识）。
+                    logger.warning(
+                        "图片内容块未水合（attachment_id=%s），已降级为占位文本；"
+                        "这是程序缺陷，请检查发请求前的水合逻辑",
+                        part.attachment_id,
+                    )
+                    parts.append({"type": "text", "text": "[图片未能加载，已略过]"})
+                    continue
                 has_image = True
                 url = part.url or f"data:{part.media_type};base64,{part.data}"
                 parts.append({"type": "image_url", "image_url": {"url": url}})
@@ -183,8 +211,16 @@ class OpenAIChatProtocol(BaseLlmProtocol):
                 payload[key] = value
         if s.response_format == "json_object":
             payload["response_format"] = {"type": "json_object"}
-        if s.extra_body:
-            payload["extra_body"] = s.extra_body
+        # 思考档位翻译（reasoning_effort / enable_thinking+thinking_budget /
+        # thinking.type）落在 extra_body 通道——openai SDK 会把它并入请求体
+        # 顶层，正是各家兼容端点期望的位置。用户显式 extra_body 同名键优先
+        # （逃生舱语义）。
+        extra = {
+            **thinking_body_fragment(s.thinking_level, self._model_info(model_id), model_id),
+            **(s.extra_body or {}),
+        }
+        if extra:
+            payload["extra_body"] = extra
         if stream:
             payload["stream"] = True
             if self.preset.compat.supports_stream_usage:

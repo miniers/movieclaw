@@ -70,11 +70,20 @@ export interface AgentEvent {
 
 /* —— 服务端会话（JSONL 转录的投影，见 movieclaw_api.schemas.agent）—— */
 
-/** 转录消息的内容块（movieclaw_llm ContentPart 的前端投影）。 */
+/** 转录消息的内容块（movieclaw_llm ContentPart 的前端投影）。
+ *  image 块只带引用（attachment_id）：字节永不进转录接口，
+ *  渲染时经 sessionAttachmentUrl 取图。 */
 export type AgentContentPart =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
-  | { type: "image"; url?: string | null; data?: string | null; media_type?: string | null };
+  | {
+      type: "image";
+      url?: string | null;
+      data?: string | null;
+      media_type?: string | null;
+      attachment_id?: string | null;
+      name?: string | null;
+    };
 
 /** 转录里的一次工具调用（参数已由协议层解析为对象）。 */
 export interface AgentTranscriptToolCall {
@@ -108,6 +117,8 @@ export interface SessionMessageEntry {
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
   /** 约定含 "aborted"：该步产出时运行被取消 */
   finish_reason?: string | null;
+  /** user 消息生效的思维链档位；null/缺省 = 模型默认 */
+  thinking_level?: string | null;
 }
 
 /** 会话详情里的一条压缩行；replacement_history 是续聊所用的完整替代上下文。 */
@@ -163,13 +174,52 @@ interface ApiEnvelope<T> {
   data: T;
 }
 
-/** 提交一条用户消息；不传 sessionId 新建会话，传入则继续已有会话。 */
+/** 图片附件上传成功的回执；attachment_id 随后交给 startSession 引用。 */
+export interface AgentAttachmentUpload {
+  attachment_id: string;
+  name: string;
+  width: number;
+  height: number;
+  bytes: number;
+}
+
+/** 上传一张图片附件（先上传拿 id，发消息时引用；24h 未引用会被服务端回收）。 */
+export async function uploadSessionAttachment(
+  file: Blob,
+  name: string,
+): Promise<AgentAttachmentUpload> {
+  const form = new FormData();
+  form.append("file", file, name);
+  const response = await request<ApiEnvelope<AgentAttachmentUpload>>(
+    "/sessions/attachments",
+    { method: "POST", body: form },
+  );
+  return response.data;
+}
+
+/** 会话内附件的取图地址（immutable 内容，浏览器可长期缓存）。 */
+export function sessionAttachmentUrl(sessionId: string, attachmentId: string): string {
+  return resolveRequestUrl(`/sessions/${sessionId}/attachments/${attachmentId}`);
+}
+
+/** 提交一条用户消息；不传 sessionId 新建会话，传入则继续已有会话。
+ *  attachments 为已上传的图片附件编号（内容块由服务端组装）；
+ *  thinkingLevel 为思维链档位（"default" 清回模型默认，不传沿用上一条）。 */
 export async function startSession(
   content: string,
   sessionId?: string,
+  attachments?: string[],
+  thinkingLevel?: string,
 ): Promise<{ sessionId: string; messageId: string }> {
-  const body: { content: string; session_id?: string } = { content };
+  const body: {
+    content: string;
+    session_id?: string;
+    attachments?: string[];
+    thinking_level?: string;
+  } = { content };
   if (sessionId) body.session_id = sessionId;
+  if (attachments && attachments.length > 0) body.attachments = attachments;
+  if (thinkingLevel) body.thinking_level = thinkingLevel;
   const response = await request<ApiEnvelope<{ session_id: string; message_id: string }>>(
     "/sessions",
     {
@@ -178,6 +228,21 @@ export async function startSession(
     },
   );
   return { sessionId: response.data.session_id, messageId: response.data.message_id };
+}
+
+/** 一个可显式调用的 Agent 技能（composer 加号菜单的数据源）。 */
+export interface AgentSkill {
+  /** 技能名，也是 /skill:名字 占位符里的名字 */
+  name: string;
+  description: string;
+  /** builtin=随产品内置，user=用户技能目录 */
+  scope: string;
+}
+
+/** 可显式调用的技能清单（服务端每次现扫，改技能即生效，因此不做缓存）。 */
+export async function listSkills(): Promise<AgentSkill[]> {
+  const response = await request<ApiEnvelope<AgentSkill[]>>("/skills");
+  return response.data;
 }
 
 /** 最近会话列表（按最后活跃时间倒序，limit/offset 分页）。 */
