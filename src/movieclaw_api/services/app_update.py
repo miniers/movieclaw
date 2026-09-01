@@ -427,32 +427,136 @@ def reset_release_cache_for_tests() -> None:
     _releases_cached = None
 
 
+# 网络级失败的退避重试节奏。只重试「线路抖动」：代理链路（尤其 socks5）
+# 偶发建连失败很常见，而检查更新是每小时一次的低频操作，多试两次的代价
+# 远低于给用户报一次假的「网络不可达」——原先零重试，一次抖动就报错。
+_RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+
+# 值得重试的瞬时故障。**httpx.ProxyError 必须单列**：它不是 NetworkError 的
+# 子类，而是 TransportError 下与之平级的分支，只写 NetworkError 会把代理故障
+# 整类漏掉——而 SOCKS5 用户最常撞上的恰恰就是它（代理握手失败、Clash 回
+# 「host unreachable」、认证被拒都归到 ProxyError）。RemoteProtocolError
+# （代理未回响应就断开）同理，检查更新是幂等 GET，重试安全。
+_RETRYABLE_NETWORK_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.ProxyError,
+    httpx.RemoteProtocolError,
+)
+
+
+def _proxy_hint() -> str:
+    """当前 GitHub 出口的中文描述，拼进错误信息里。
+
+    用户排查时的第一个疑问永远是「我配的代理到底生效了没」，把答案直接
+    写进报错，省掉一轮来回。
+    """
+    proxy = resolve_proxy_url("github")
+    return f"当前经代理 {proxy} 访问" if proxy else "当前为直连（未对 GitHub 启用代理）"
+
+
+def _describe_github_error(exc: httpx.HTTPError, what: str) -> str:
+    """把底层网络异常翻译成能直接指导下一步的中文说明。
+
+    原先这里不分青红皂白统一报「无法连接 GitHub，请确认网络可达」，把限流、
+    超时、连接被拒糊成同一句话，异常本身（``__cause__``）又从不外露——用户在
+    「设置 → 网络」测出绿灯后完全无从下手。而绿灯与红灯并存本就是常态：
+    连通性测试把 403 判为「网络连通，但限流中」，这里却当成连不上。错误分类
+    必须与连通性测试同口径，两处结论才不会互相打架。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        if response.status_code in (403, 429):
+            if response.headers.get("x-ratelimit-remaining") == "0":
+                reset = response.headers.get("x-ratelimit-reset", "")
+                recover = ""
+                if reset.isdigit():
+                    minutes = max(0, int((int(reset) - time.time()) // 60)) + 1
+                    recover = f"约 {minutes} 分钟后自动恢复，"
+                return (
+                    f"GitHub 接口配额已用尽，暂时无法检查{what}。未认证访问限 60 次/"
+                    f"小时/IP，走代理时该配额由出口节点的所有用户共享，"
+                    f"因此可能并非本机用量所致。{recover}期间不影响已装版本运行。"
+                    f"{_proxy_hint()}"
+                )
+            return (
+                f"GitHub 拒绝了本次请求（HTTP {response.status_code}），无法检查{what}。"
+                f"通常是出口 IP 触发了频率限制或风控，稍后会自动重试。{_proxy_hint()}"
+            )
+        return (
+            f"GitHub 返回异常状态（HTTP {response.status_code}），无法检查{what}，"
+            f"请稍后重试。{_proxy_hint()}"
+        )
+    if isinstance(exc, httpx.ProxyError):
+        # SOCKS5 用户最常撞上的一类：代理进程在线（所以「设置 → 网络」的测试
+        # 可能刚好赶上一次成功），但本次转发被拒——节点掉线、分流规则命中
+        # REJECT、认证失败都会走到这里。必须点名是代理拒绝而非 GitHub 不可达。
+        return (
+            f"代理拒绝了到 GitHub 的转发，无法检查{what}（{exc}）。{_proxy_hint()}；"
+            "请确认代理节点在线、认证信息正确，且 api.github.com 命中的分流规则"
+            "不是 REJECT/DIRECT"
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            f"连接 GitHub 超时，无法检查{what}。{_proxy_hint()}；"
+            "若代理按域名分流，请确认 api.github.com 走的是代理而非直连"
+        )
+    return (
+        f"无法连接 GitHub 检查{what}（{type(exc).__name__}：{exc}）。{_proxy_hint()}；"
+        "可在「设置 → 网络」调整代理，或用 UPDATE_API_BASE_URL 配置反代"
+    )
+
+
 async def _fetch_releases(what: str) -> list[dict]:
     """拉全部 Release 列表（应用与模型的 Release 混在同一个仓库里，
     必须列表过滤，绝不能用 /releases/latest——模型发布会把 latest 顶掉）。"""
     global _releases_etag, _releases_cached
     settings = get_settings()
-    api_url = f"{settings.update_api_base_url}/repos/{settings.update_repo}/releases?per_page=100"
+    # 反代地址常被写成带尾斜杠的形式，不去掉会拼出 //repos/... ——不少反代
+    # 对双斜杠直接 404，而「设置 → 网络」的连通性测试是 rstrip 过的，
+    # 于是测试通过、检查更新却失败，两处必须同口径
+    base_url = settings.update_api_base_url.rstrip("/")
+    api_url = f"{base_url}/repos/{settings.update_repo}/releases?per_page=100"
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "movieclaw-updater"}
     if _releases_etag and _releases_cached is not None:
         headers["If-None-Match"] = _releases_etag
     async with httpx.AsyncClient(
-        # 走统一网络出口（服务标签 github）：设置页可为更新流量单独开关代理
-        transport=egress_transport("github"),
+        # 走统一网络出口（服务标签 github）：设置页可为更新流量单独开关代理。
+        # 但**不上熔断**：熔断是为「用户正等着结果的高频请求」（发现页曾拖满
+        # 49 秒）设计的快速失败，而更新检查是每小时一次的后台任务加偶尔手动
+        # 点一次。熔断状态横跨这两个语境，只会让后台任务攒下的失败把用户手动
+        # 点的「检查更新」误伤成秒级失败——而同一时刻连通性测试（同样
+        # use_breaker=False，且成功后还会 reset）却是绿的，正是「测试可达但
+        # 检查更新报不可达」的成因之一。两条路径的出口口径就此对齐。
+        transport=egress_transport("github", use_breaker=False),
         timeout=_HTTP_TIMEOUT,
         follow_redirects=True,
         headers=headers,
     ) as client:
-        try:
-            resp = await client.get(api_url)
-            if resp.status_code == 304 and _releases_cached is not None:
-                return _releases_cached
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise BadRequestException(
-                f"无法连接 GitHub 检查{what}，"
-                "请确认网络可达（可配置代理或 UPDATE_API_BASE_URL 反代）"
-            ) from exc
+        for attempt in range(len(_RETRY_BACKOFF_SECONDS) + 1):
+            try:
+                resp = await client.get(api_url)
+                if resp.status_code == 304 and _releases_cached is not None:
+                    return _releases_cached
+                resp.raise_for_status()
+            except _RETRYABLE_NETWORK_ERRORS as exc:
+                if attempt == len(_RETRY_BACKOFF_SECONDS):
+                    raise BadRequestException(_describe_github_error(exc, what)) from exc
+                delay = _RETRY_BACKOFF_SECONDS[attempt]
+                logger.info(
+                    "检查%s时连接 GitHub 失败（第 %d 次：%s），%.0f 秒后重试",
+                    what,
+                    attempt + 1,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            except httpx.HTTPError as exc:
+                # HTTP 状态错误不重试：限流/风控下重试只会加速耗尽配额，
+                # 直接交给错误分类给出准确结论
+                raise BadRequestException(_describe_github_error(exc, what)) from exc
+            break
         releases = resp.json()
         etag = resp.headers.get("etag")
         if etag:
@@ -487,8 +591,8 @@ async def _fetch_latest_release() -> tuple[dict, dict]:
         raise BadRequestException("未找到任何应用发布（vX.Y.Z 的 Release），暂无可用更新")
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "movieclaw-updater"}
     async with httpx.AsyncClient(
-        # 走统一网络出口（服务标签 github）：设置页可为更新流量单独开关代理
-        transport=egress_transport("github"),
+        # 走统一网络出口（服务标签 github），同 _fetch_releases 不上熔断
+        transport=egress_transport("github", use_breaker=False),
         timeout=_HTTP_TIMEOUT,
         follow_redirects=True,
         headers=headers,
@@ -1127,7 +1231,7 @@ async def start_model_update() -> UpdateProgressView:
             )
         headers = {"User-Agent": "movieclaw-updater"}
         async with httpx.AsyncClient(
-            transport=egress_transport("github"),
+            transport=egress_transport("github", use_breaker=False),
             timeout=_HTTP_TIMEOUT,
             follow_redirects=True,
             headers=headers,
